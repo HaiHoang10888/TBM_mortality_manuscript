@@ -1,0 +1,3245 @@
+---
+title: 'Mortatlity in TBM based baseline gene expression '
+author: "Haiht"
+date: '2023-03-31'
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+editor_options: 
+  chunk_output_type: console
+---
+
+# Set up R enviroment {.tabset .tabset-fade .tabset-pills}
+Set the random generator seed so we can reproduce exactly results without any stochasticity
+
+```{r setup, message=FALSE, warning=FALSE, echo= FALSE, results='hide'}
+knitr::opts_chunk$set(
+	fig.height = 6,
+	fig.width = 8,
+	message = FALSE,
+	warning = FALSE
+	)
+
+ # Set the random generator seed so we can reproduce exactly results without any stochasticity
+#rm(list=ls())
+set.seed(1235)
+```
+
+
+```{r}
+library(ggplot2)
+library(WGCNA)
+library(Hmisc)
+library(dplyr)
+library(magrittr)
+library(stringr)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(AnnotationDbi)
+library(enrichplot)
+library(GOSemSim)
+library(ReactomePA)
+library(heatmaply)
+library(survival)
+library(survminer)
+```
+
+
+# 1. Load input data
+
+```{r}
+getwd()
+source("../R_functions/WGCNA_CEMitool_Allfunctions_5May2022.R")
+source("../R_functions/functions_preservation_WGCNA_mortality_analysis.R")
+
+## set multi threads
+enableWGCNAThreads(nThreads=12)
+
+# Load the data saved in the first part
+output <- "WGCNA/All_study/Consensus_TBM/Discovery_validation_Dex_HIV/"
+study = "TBM_Death_281"
+lnames = load( paste0(output,"RData/",study,"-01-dataInput.RData"));
+lnames
+dim(multiExpr[[2]]$data)
+names(Traits[[1]]$data)
+
+# Load the results of network analysis, tutorial part 2.a
+lnames = load(file = paste0(output,"RData/",study_dis,"-02-networkConstruction-auto.RData"));
+lnames
+exprSize = checkSets(multiExpr);
+nSets = exprSize$nSets;
+
+## get order of modules in discovery
+moduleOrder <- unique(net_dis$colors) 
+names(moduleOrder) <- labels2colors(unique(net_dis$colors))
+index <- match(as.numeric(str_replace_all(names(MEs_dis),"ME","")),moduleOrder)
+moduleOrder <- paste0("ME",names(moduleOrder[index]))
+```
+
+```{r}
+cor(datExpr$NELL2,datExpr$MCEMP1)
+```
+
+
+# 2. ME, moduleTraitCor,moduleTraitPvalue
+
+```{r}
+# Set up variables to contain the ME 
+MEs = list();
+# Calculate the ME for discovery and validation
+for (set in 1:nSets){
+  MEs[[set]] = list(data = as.data.frame(moduleEigengenes(multiExpr[[set]]$data, moduleColors_dis)$eigengenes[moduleOrder]));
+}
+```
+
+```{r}
+# Isolate Death from the clinical traits
+# Death = as.data.frame(Traits[[1]]$data$evdeath_3M);
+# names(Death) = "Death"
+# # Add the Death to existing module eigengenes
+MEs_dis <- MEs[[1]]$data
+# MET = orderMEs(cbind(MEs_dis, Death))
+# Plot the relationships among the eigengenes and the trait
+jpeg(file = paste0(output_figures,study_dis,"-Module_dendrogram.jpeg"), wi = 7, he = 3,units = 'in', res = 480)
+# sizeGrWindow(5,7.5);
+par(cex = 0.9)
+plotEigengeneNetworks(MEs_dis, "", marDendro = c(0,3.5,1,4.5), marHeatmap = c(4,4,0,2), cex.lab = 0.8, xLabelsAngle = 90, colorLabels=F,plotHeatmaps = FALSE)
+dev.off()
+```
+
+```{r}
+# # Isolate Death from the clinical traits
+# Death = as.data.frame(Traits[[2]]$data$evdeath_3M);
+# names(Death) = "Death"
+# # Add the Death to existing module eigengenes
+MEs_val <- MEs[[2]]$data
+# MET = orderMEs(cbind(MEs_val, Death))
+# Plot the relationships among the eigengenes and the trait
+jpeg(file = paste0(output_figures,study_val,"-Module_dendrogram.jpeg"), wi = 7, he = 7,units = 'in', res = 480)
+#sizeGrWindow(5,7.5);
+par(cex = 0.9)
+plotEigengeneNetworks(MEs_val, "", marDendro = c(0,3.5,1,4.5), marHeatmap = c(4,4,0,2), cex.lab = 0.8, xLabelsAngle
+= 90, colorLabels=F)
+dev.off()
+```
+
+
+
+
+```{r}
+ # Set up variables to contain the module-trait correlations
+moduleTraitCor = list();
+moduleTraitPvalue = list();
+#cli_var <- c("AGE","TBM_HIV","TT_LTA4H","TBMGRADE","evdeath_3M", "Treatment_Dex")
+cli_var <- c("TBMGRADE","evdeath_3M")
+
+# Calculate the correlations
+for (set in 1:nSets){
+  moduleTraitCor[[set]] = cor(MEs[[set]]$data, Traits[[set]]$data[,cli_var], use = "p", method = "spearman");
+  moduleTraitPvalue[[set]] = corPvalueFisher(moduleTraitCor[[set]], exprSize$nSamples[set]);
+}
+
+#################################### subset data to perform cox model
+MEs1 <- MEs[[1]]$data
+MEs2 <- MEs[[2]]$data
+Traits1 <- Traits[[1]]$data
+Traits2 <- Traits[[2]]$data
+all(rownames(MEs1)== rownames(Traits1))
+all(rownames(MEs2)== rownames(Traits2))
+
+#################################### Discovery cox
+p_value <- NULL
+exp_coef_ME <- NULL
+coef_ME <- NULL
+module <- NULL
+n=97
+i=1
+
+table(is.na(Traits1$Treatment))
+for (i in 1:ncol(MEs1)){
+  ME_name <- colnames(MEs1)[i]
+  data_ME <- data.frame(module=MEs1[,i])
+  data_test <- cbind(Traits1,data_ME)
+  data_test$SEX <- factor(data_test$SEX)
+  # data_test$Treatment
+  fit <- coxph(Surv(pmin(ttdeath,n),ifelse(ttdeath<=n,evdeath,0))~ I(module*10) +  AGE + Treatment + Study, data =data_test)
+  temp_p <- summary(fit)$coefficients[1,5]
+  temp_coef <- round(summary(fit)$coefficients[1,1],2)
+  temp_exp_coef <- round(summary(fit)$coefficients[1,2],2)
+  print(temp_coef)
+  module <- c(module, ME_name)
+  p_value <- c(p_value, temp_p)
+  coef_ME <- c(coef_ME, temp_coef)
+  exp_coef_ME <- c(exp_coef_ME, temp_exp_coef)
+}
+data_cox1 <- data.frame(module= module, coef= coef_ME,  exp_coef_ME= exp_coef_ME, pvalue = p_value)
+
+
+table(is.na(Traits2$Treatment))
+### Validation cox
+p_value <- NULL
+exp_coef_ME <- NULL
+coef_ME <- NULL
+module <- NULL
+i=1
+for (i in 1:ncol(MEs2)){
+  ME_name <- colnames(MEs2)[i]
+  data_ME <- data.frame(module=MEs2[,i])
+  data_test <- cbind(Traits2,data_ME)
+  data_test$SEX <- factor(data_test$SEX)
+  fit <- coxph(Surv(pmin(ttdeath,n),ifelse(ttdeath<=n,evdeath,0))~ I(module*10) +   AGE + Treatment + Study, data =data_test)
+  temp_p <- summary(fit)$coefficients[1,5]
+  temp_coef <- round(summary(fit)$coefficients[1,1],2)
+  temp_exp_coef <- round(summary(fit)$coefficients[1,2],2)
+  print(temp_coef)
+  module <- c(module, ME_name)
+  p_value <- c(p_value, temp_p)
+  coef_ME <- c(coef_ME, temp_coef)
+  exp_coef_ME <- c(exp_coef_ME, temp_exp_coef)
+}
+
+
+data_cox2 <- data.frame(module= module, coef= coef_ME, exp_coef_ME= exp_coef_ME,pvalue = p_value)
+
+## scale HZ rarito
+scalar1 <- function(x) {x / sqrt(sum(x^2))}
+
+data_cox1$coef <-  scalar1(data_cox1$coef)
+data_cox2$coef <-  scalar1(data_cox2$coef)
+
+data_cox1$padj <- p.adjust(data_cox1$pvalue,method = "BY")
+data_cox2$padj <- p.adjust(data_cox2$pvalue,method = "BY")
+
+### replace corelation with HZ and P value
+all(data_cox1$module==rownames(moduleTraitCor[[1]]))
+all(data_cox1$module==rownames(moduleTraitPvalue[[1]]))
+
+index_death = which(colnames(moduleTraitCor[[1]])=="evdeath_3M")
+## add log HR to cor matrix
+moduleTraitCor[[1]][,index_death] <- data_cox1$coef
+moduleTraitCor[[2]][,index_death] <- data_cox2$coef
+
+## add HR to cor matrix
+moduleTraitCor[[1]] <- cbind(moduleTraitCor[[1]], data_cox1$exp_coef_ME)
+moduleTraitCor[[2]] <- cbind(moduleTraitCor[[2]], data_cox2$exp_coef_ME)
+
+## add padjust to P matrix
+moduleTraitPvalue[[1]][,index_death] <- data_cox1$padj 
+moduleTraitPvalue[[2]][,index_death] <- data_cox2$padj
+```
+
+# 3. Plot heatmap for module vs trait relationship for discovery and validation
+
+## 1. color scaled by MRC
+
+```{r}
+library(stringr)
+zlim = c(min(c(moduleTraitCor[[1]][,1],moduleTraitCor[[2]][,1])) - 0.1, 
+         max(c(moduleTraitCor[[1]][,1],moduleTraitCor[[2]][,1])) + 0.1)
+mar_set <- c(6, 14, 6, 14)
+
+MEColorNames = rownames(moduleTraitCor[[1]]);
+MEColorNames <- str_replace_all(MEColorNames, "ME","")
+# Open a suitably sized window (the user should change the window size if necessary)
+jpeg(file = paste0(output_figures,study_dis,"-ModuleTraitRelationships_colorMRC.jpeg"), wi = 7, he = 7,units = 'in', res = 480)
+set = 1
+modtraitsymbol <- pval2symbol(moduleTraitPvalue[[set]][,1])
+textMatrix <- paste(signif(moduleTraitCor[[set]][,c(1)], 2),modtraitsymbol,sep = " ");
+dim(textMatrix) = c(15,1)
+par(mar = mar_set);
+
+in_matrix <- as.matrix(moduleTraitCor[[set]][,c(1)])
+# moduleTraitPvalue_T <- 0.5- moduleTraitPvalue[[set]]
+labeledHeatmap(Matrix = in_matrix,
+               xLabels = c("MRC"),
+               yLabels = MEColorNames,
+               ySymbols = MEColorNames,
+               colorLabels = FALSE,
+               colors = greenWhiteRed(50),
+               textMatrix = textMatrix,
+               setStdMargins = FALSE,
+               cex.text = 0.8,
+               zlim = c(-1,1),
+               main = "Discovery")
+dev.off();
+
+# Plot the module-trait relationship table for set number 2
+jpeg(file = paste0(output_figures,study_val,"-ModuleTraitRelationships_colorMRC.jpeg"), wi = 7, he = 7,units = 'in', res = 480)
+set = 2
+modtraitsymbol <- pval2symbol(moduleTraitPvalue[[set]][,1])
+textMatrix <- paste(signif(moduleTraitCor[[set]][,c(1)], 2),modtraitsymbol,sep = " ");
+dim(textMatrix) = c(15,1)
+par(mar = mar_set);
+# zlim = c(min(moduleTraitCor[[set]][,1]) - 0.1, max(moduleTraitCor[[set]][,1]) + 0.1)
+in_matrix <- as.matrix(moduleTraitCor[[set]][,c(1)])
+# moduleTraitPvalue_T <- 0.5- moduleTraitPvalue[[set]]
+labeledHeatmap(Matrix = in_matrix,
+               xLabels = c("MRC"),
+               yLabels = MEColorNames,
+               ySymbols = MEColorNames,
+               colorLabels = FALSE,
+               colors = greenWhiteRed(50),
+               textMatrix = textMatrix,
+               setStdMargins = FALSE,
+               cex.text = 0.8,
+               zlim = c(-1,1),
+               main = "Discovery")
+dev.off();
+
+```
+
+## 2. color scaled by Death
+
+```{r}
+library(stringr)
+
+MEColorNames = rownames(moduleTraitCor[[1]]);
+MEColorNames <- str_replace_all(MEColorNames, "ME","")
+# Open a suitably sized window (the user should change the window size if necessary)
+jpeg(file = paste0(output_figures,study_dis,"-ModuleTraitRelationships_colorDeath.jpeg"), wi = 7, he = 7,units = 'in', res = 480)
+set = 1
+modtraitsymbol <- pval2symbol(moduleTraitPvalue[[set]][,2])
+textMatrix <- paste(signif(moduleTraitCor[[set]][,c(3)], 2),modtraitsymbol,sep = " ");
+dim(textMatrix) = c(15,1)
+par(mar = mar_set);
+
+in_matrix <- as.matrix(moduleTraitCor[[set]][,c(3)])
+# moduleTraitPvalue_T <- 0.5- moduleTraitPvalue[[set]]
+labeledHeatmap(Matrix = in_matrix,
+               xLabels = c("Death"),
+               yLabels = MEColorNames,
+               ySymbols = MEColorNames,
+               colorLabels = FALSE,
+               colors = greenWhiteRed(50),
+               textMatrix = textMatrix,
+               setStdMargins = FALSE,
+               cex.text = 0.8,
+               zlim = c(0,2),
+               main = "Discovery")
+dev.off();
+
+# Plot the module-trait relationship table for set number 2
+jpeg(file = paste0(output_figures,study_val,"-ModuleTraitRelationships_colorDeath.jpeg"), wi = 7, he = 7,units = 'in', res = 480)
+set = 2
+modtraitsymbol <- pval2symbol(moduleTraitPvalue[[set]][,2])
+textMatrix <- paste(signif(moduleTraitCor[[set]][,c(3)], 2),modtraitsymbol,sep = " ");
+dim(textMatrix) = c(15,1)
+par(mar = mar_set);
+# zlim = c(min(moduleTraitCor[[set]][,1]) - 0.1, max(moduleTraitCor[[set]][,1]) + 0.1)
+in_matrix <- as.matrix(moduleTraitCor[[set]][,c(3)])
+# moduleTraitPvalue_T <- 0.5- moduleTraitPvalue[[set]]
+labeledHeatmap(Matrix = in_matrix,
+               xLabels = c("Death"),
+               yLabels = MEColorNames,
+               ySymbols = MEColorNames,
+               colorLabels = FALSE,
+               colors = greenWhiteRed(50),
+               textMatrix = textMatrix,
+               setStdMargins = FALSE,
+               cex.text = 0.8,
+               zlim = c(0,2),
+               main = "Discovery")
+dev.off();
+
+```
+
+
+
+
+# 4. Plot P value of modules vs 3 month mortality in discovery and validation
+
+```{r}
+df_plot <- data.frame(x=-log10(data_cox1$padj), y=-log10(data_cox2$padj), module=str_replace(data_cox1$module,"ME",""))
+color=df_plot$module
+df_plot$module <- factor(df_plot$module, levels = color)
+library(ggrepel)
+target1 <- c("blue", "brown","red", "cyan", "black")
+# reduce overlap point
+target2 <- c("turquoise", "magenta","grey", "salmon", "purple")
+df1=subset(df_plot,module %nin% target2)
+color1 <- as.character(df1$module)
+df2=subset(df_plot,module %in% target2)
+color2 <- as.character(df2$module)
+jpeg(file = paste0(output_figures,study_val,"-Pvalue_Discovery_vs_Validation.jpeg"), wi = 6, he = 6,units = 'in', res = 480)
+
+pos <- position_jitter(width = 0.1,height = 0.1, seed = 2)
+ggplot(df1,aes(x = x, y = y, label = module, color =module)) +
+  geom_point(color=color1, size=6,alpha=0.7) +
+  geom_text_repel(color="black",fontface='bold',nudge_x = 0.2,nudge_y = 0.2, force = 0.5) +
+  geom_jitter(data=df2,aes(x = x, y = y),color=color2, size=6,alpha=0.7, 
+              position = pos) +
+  geom_text_repel(data=df2,color="black",fontface='bold', position = pos) +
+  labs(x=expression(bold(-Log[10] ~ "(FDR) Discovery cohort (n=142)")),
+         y = expression(bold(-Log[10] ~ "(FDR) Validation cohort (n=139)")), title = "")+
+  geom_hline(yintercept=-log10(0.05), linetype="dashed", color = "red")+
+  geom_vline(xintercept=-log10(0.05), linetype="dashed", color = "red")+
+  theme_bw()+
+  theme(plot.title = element_text(size = 20),
+        legend.text = element_text(size = 15) ,
+        legend.position="none",
+        legend.title = element_text(size = 13,color="black",face="bold"),
+        axis.text.x=element_text(color="black",size=13,face="bold"),
+        axis.title.x = element_text(size = 13,color="black",face="bold"),
+        axis.text.y=element_text(color="black",size=13,face="bold"),
+        #axis.ticks.y = element_blank(),
+        axis.title.y = element_text(size = 13,color="black",face="bold"))
+    #scale_y_continuous(limits = c(0,3))
+dev.off()
+```
+
+
+# 5. ORA functional enrichment
+
+```{r eval=FALSE, include=FALSE}
+#=====================================================================================
+#  Code chunk 5
+#=====================================================================================
+source("../R_functions/WGCNA_CEMitool_Allfunctions_5May2022.R")
+anno_df <- anno %>% 
+  mutate(Ensembl_ID=gene_id,
+         Gene_symbol =gene_symbol ,
+         Gene_type= class) %>%
+  dplyr::select(Gene_symbol,Ensembl_ID,Gene_type)
+anno_df$Gene_symbol_1 <- str_replace_all(anno_df$Gene_symbol,"-","\\.")
+
+module_gene_list <- data.frame(Gene_symbol_1=names(moduleLabels_dis), module=moduleColors_dis)
+module_gene_list %<>%  
+merge(.,anno_df,by="Gene_symbol_1", all.x=T) %>%
+  filter(!duplicated(Gene_symbol)) %>%
+  dplyr::select(Ensembl_ID,Gene_symbol,Gene_type,module) %>%
+  dplyr::arrange(module,Gene_type)
+
+dim(module_gene_list)
+write.csv(module_gene_list,paste0(output,study,"-module_gene_list.csv"), row.names = F)
+
+## barplot for gene number
+library(ggplot2)
+library(ggthemes)
+library(extrafont)
+library(plyr)
+library(scales)
+t <- table(moduleColors_dis)
+t <- data.frame(module=names(t),number=unname(t)) %>%
+  dplyr::arrange(number.Freq)
+charts.data <- ddply(t, .(module), transform, pos = cumsum(number.Freq) +25) %>%
+  dplyr::arrange(number.Freq)
+col_M <- charts.data$module
+charts.data$module <- factor(charts.data$module, levels=col_M)
+
+p3 <- ggplot() +
+  geom_bar(aes(y = number.Freq, x = module, fill = module), data = charts.data, stat="identity") +
+  geom_text(data=charts.data, aes(x = module, y = pos, label = number.Freq), colour="black",
+            family="Tahoma", size = 4, show_guide = F) +
+  theme(legend.position="none", legend.direction="horizontal",
+        legend.title = element_blank()) +
+  labs(x="Module", y="Number of genes") +
+  ggtitle("") +
+  scale_fill_manual(values=col_M) +
+  theme_bw()+
+  theme(plot.title = element_text(size = 20),
+        legend.text = element_text(size = 15) ,
+        legend.position="none",
+        legend.title = element_text(size = 13,color="black",face="bold"),
+        axis.text.x=element_text(color="black",size=13,angle = 90, vjust = 0.5, hjust=1),
+        axis.title.x = element_text(size = 13,color="black",face="bold"),
+        axis.text.y=element_text(color="black",size=13),
+        axis.title.y = element_text(size = 13,color="black",face="bold"))
+jpeg(file = paste0(output,"general_output/figures/ModuleGenenumber.jpeg"), wi = 8, 
+     he = 6, units = "in",res=300)
+p3
+dev.off()
+
+## plot ORA results
+for (i in unique(moduleColors_dis)) {
+  gene_list <- names(moduleLabels_dis[moduleColors_dis==i])
+  ora <- ora_GO_single(gene_list)
+  p <- plot_ora_single(head(ora@result, n=5),
+                       pv_cut=0.05,
+                       graph_color=i,
+                       title=paste0(i, " module"))
+  jpeg(file =  paste0(output,"ORA/",study,"-",i,"-ORA_GO.jpeg"), wi = 3.5, 
+       he = 3, units = "in",res=480)
+  print(p)
+  dev.off()
+}
+
+### plot correlation plot of genes in specific modules
+module="blue"
+gene_list <- names(moduleLabels_dis[moduleColors_dis==module])
+# Discovery
+heatmaply_cor(x = cor(multiExpr[[1]]$data[,gene_list]),
+              xlab = "Features",
+              ylab = "Features",
+              k_col = 2,
+              k_row = 2)
+# Validation
+heatmaply_cor(x = cor(multiExpr[[2]]$data[,gene_list]),
+                   xlab = "Features",
+                   ylab = "Features",
+                   k_col = 2,
+                   k_row = 2)
+```
+
+
+# 6. Get hub genes
+
+```{r}
+anno <- "../count_expression/raw_data/GeneAnnotationFile_EnsembltoGeneIds.txt"
+anno <- read.table(anno,header = T)
+anno_coding <- subset(anno,class=="protein_coding")
+anno_df <- anno %>% 
+  mutate(Ensembl_ID=gene_id,
+         Gene_symbol =gene_symbol ,
+         Gene_type= class) %>%
+  dplyr::select(Gene_symbol,Ensembl_ID,Gene_type)
+anno_df$Gene_symbol_1 <- str_replace_all(anno_df$Gene_symbol,"-","\\.")
+pheno_name="evdeath_3M"
+
+pheno_index = c(which(names(Traits[[1]]$data) %in% c("ttdeath","evdeath")),
+                which(names(Traits[[1]]$data) %in% c("AGE","Treatment", "Study")))
+
+data_output = list();
+
+for (set in 1:nSets){
+data_output[[set]] <- get_GSCox_WGCNA(Expr = multiExpr[[set]]$data,pheno =Traits[[set]]$data,pheno_index = pheno_index,evdays=97,covar = 3)
+data_output[[set]]$GeneSignificance <- p.adjust(data_output[[set]]$GeneSignificance,method = "BH")
+}
+
+table(Traits[[1]]$data$Treatment)
+table(Traits[[2]]$data$Treatment)
+
+# Set up variables to contain the module membership
+geneModuleMembership = list();
+MMPvalue = list();
+for (set in 1:nSets){
+  geneModuleMembership[[set]] = cor(multiExpr[[set]]$data, MEs[[set]]$data, use = "p", method = "spearman");
+  colnames(geneModuleMembership[[set]]) = paste("MM", colnames(MEs[[set]]$data), sep="");
+  
+  MMPvalue[[set]] = corPvalueFisher(geneModuleMembership[[set]], exprSize$nSamples[set]);
+  colnames(MMPvalue[[set]]) = paste("p.MM", colnames(MEs[[set]]$data), sep="")
+}
+
+# Set up variables to contain the gene trait significance
+geneTraitSignificance = list();
+GSPvalue = list();
+for (set in 1:nSets){
+  geneTraitSignificance[[set]] = cor(multiExpr[[set]]$data, Traits[[set]]$data[,"evdeath_3M"], use = "p", method = "spearman");
+  colnames(geneTraitSignificance[[set]]) = paste("GS.", pheno_name, sep="");
+  
+  GSPvalue[[set]] = corPvalueFisher(geneTraitSignificance[[set]], exprSize$nSamples[set]);
+  colnames(GSPvalue[[set]]) = paste("p.GS.", pheno_name, sep="");
+}
+
+# Set up variables to contain the gene trait significance
+geneTraitHZ <- geneTraitSignificance
+## assign P value and HZ from cox model to gene trait significant
+# all(rownames(geneTraitSignificance[[2]]) == data_output[[2]]$Gene)
+for (set in 1:nSets){
+  geneTraitSignificance[[set]][,1] <- -log10(data_output[[set]]$GeneSignificance)
+  geneTraitHZ[[set]][,1] <- data_output[[set]]$GeneEffect
+}
+```
+
+
+```{r}
+################################ Hub genes in 3 target modules
+library(ggpmisc)
+GS_cutoff=abs(log10(0.05))
+MM_cutoff=0.85
+module_targets = c("blue","brown","red","cyan", "black")
+# moduleGenes = moduleColors_dis==module;
+all(rownames(geneModuleMembership[[1]])==rownames(geneTraitSignificance[[1]]))
+
+# hist(geneTraitSignificance[[1]][moduleGenes, 1])
+# dev.off()
+
+studyAll <- c("TBM_Death_discovery","TBM_Death_validation")
+GSMM <- list()
+Hubgenes <- list()
+sizeGrWindow(7, 7);
+par(mfrow = c(1,1));
+for (module in module_targets) {
+  moduleGenes <- names(moduleLabels_dis[moduleColors_dis==module])
+  column = match(paste0("ME",module),  colnames(MEs[[1]]$data))
+  for (set in 1:nSets){
+    
+    formula <- y ~ x
+    data_plot <- data.frame(x=abs(geneModuleMembership[[set]][moduleGenes, column]),
+                        y=abs(geneTraitSignificance[[set]][moduleGenes, 1]))
+    max_y <- max(data_plot$y)
+    min_x <- min(data_plot$x)
+    n_gene <- dim(data_plot)[1]
+    p <-ggplot(data=data_plot,aes(x=x,y=y))+
+      geom_point(alpha=0.5,col=module, size=3)+
+      stat_poly_line(se=T, size=1.5) +
+      stat_poly_eq(aes(label = paste(..rr.label..)),
+                   formula = formula,
+                   label.x=min_x-0.2, 
+                   label.y=max_y - 0.3,
+                   size = 6) +
+      stat_fit_glance(method = 'lm', method.args = list(formula = formula),
+                      geom = 'text', aes(label = paste("P-value = ", 
+                      signif(..p.value.., digits = 2), sep = "")),
+                      label.x = min_x +0.12,
+                      label.y = max_y - 0.3,
+                      size = 6)+
+      ylab(expression(bold(Log[10] ~ "P-value with three-month mortality"))) +
+      xlab(paste0("Module membership"))+
+      ggtitle(paste0(str_to_title(module) ," module (n=",n_gene," genes)")) + 
+      theme_bw()+
+      theme(panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+        plot.title = element_text(size = 20,face="bold"),
+        legend.position = "none",
+        axis.text.x=element_text(color="black",size=13,face="bold"),
+        axis.title.x = element_text(size = 15,color="black",face="bold"),
+        axis.text.y=element_text(color="black",size=13,face="bold"),
+        axis.title.y = element_text(size = 15,color="black",face="bold"))
+    jpeg(file =  paste0(output,"Modules/",studyAll[set],"-",module,"_module.jpeg"), wi = 6.5, 
+         he = 6.5, units = "in",res=480)
+    print(p)
+    dev.off()
+    
+    jpeg(file =  paste0(output,"Modules/",studyAll[set],"-",module,"_modulevsHZ.jpeg"), wi = 6, 
+         he = 6, units = "in",res=480)
+    verboseScatterplot(abs(geneModuleMembership[[set]][moduleGenes, column]),
+                       abs(geneTraitHZ[[set]][moduleGenes, 1]),
+                       xlab = paste("Module Membership in", module, "module"),
+                       ylab = paste0("log(HZ) of Gene for ",pheno_name),
+                       main = paste("Module membership vs. HZ effect of gene\n"),
+                       cex.main = 1.2, cex.lab = 1.2, cex.axis = 1.2, col = module)
+    dev.off()
+    
+    # rownames(geneModuleMembership)[moduleGenes]
+    GSMM[[module]][[set]] <- data.frame(gene = rownames(geneModuleMembership[[set]][moduleGenes,]),
+                              MM = abs(geneModuleMembership[[set]][moduleGenes, column]),
+                              GS = abs(geneTraitSignificance[[set]][moduleGenes, 1]),
+                              HR = geneTraitHZ[[set]][moduleGenes, 1]) %>%
+      mutate(module = module,
+             MMRank = rank(-rank(MM)),
+             GSRank = rank(-rank(GS)),
+             HRRank = rank(-rank(abs(log10(HR)))),
+             totalRank = MMRank + GSRank) %>%
+      dplyr::arrange(totalRank)
+    Hubgenes[[module]][[set]] <- subset(GSMM[[module]][[set]],MM > MM_cutoff & GS > GS_cutoff) %>% 
+      filter(gene %in% anno_coding$gene_symbol)%>%
+      mutate(MMRank = rank(-rank(MM)),
+             GSRank = rank(-rank(GS)),
+             HRRank = rank(-rank(abs(log10(HR)))),
+             totalRank =  GSRank) %>%
+      dplyr::arrange(totalRank)
+  }
+}
+
+## extract MM and GS for each module
+MM_an_GS_target_modules <- NULL
+for (module in module_targets){
+  print(module)
+  dis <- GSMM[[module]][[1]]
+  colnames(dis)[-1] <- paste0(colnames(dis)[-1],"_Discovery")
+  val <- GSMM[[module]][[2]]
+  colnames(val)[-1] <- paste0(colnames(val)[-1],"_Validation")
+  d <- merge(dis,val,by="gene") %>% dplyr::arrange(totalRank_Discovery)
+  MM_an_GS_target_modules <- rbind(MM_an_GS_target_modules,d)
+  write.csv(d,paste0(output,"general_output/",module,"_modules_MMandGS.csv"))
+  
+}
+
+MM_an_GS_target_modules %<>% 
+  merge(.,anno_df, by.x="gene", by.y="Gene_symbol_1") %>%
+  mutate(Module=module_Discovery) %>%
+  dplyr::select(Gene_symbol,Module,Gene_type,MM_Discovery,GS_Discovery,
+                HR_Discovery,GSRank_Discovery,MM_Validation,GS_Validation,
+                HR_Validation,GSRank_Validation) 
+names(MM_an_GS_target_modules)
+write.csv(MM_an_GS_target_modules,paste0(output,"general_output/","MM_an_GS_target_modules.csv"))
+
+
+## test for some genes
+GSMM[["blue"]][[1]][which(GSMM[["blue"]][[1]]$gene=="MS4A4A"),]
+GSMM[["blue"]][[2]][which(GSMM[["blue"]][[2]]$gene=="MS4A4A"),]
+GSMM[["brown"]][[1]][which(GSMM[["brown"]][[1]]$gene=="TRABD2A"),]
+GSMM[["brown"]][[2]][which(GSMM[["brown"]][[2]]$gene=="TRABD2A"),]
+```
+
+
+```{r}
+## top hit validated gene in 3 modules
+dim(GSMM[["blue"]][[1]])
+
+0.03*nrow(GSMM[["blue"]][[1]])
+0.03*nrow(GSMM[["brown"]][[1]])
+0.05*nrow(GSMM[["red"]][[1]])
+0.05*nrow(GSMM[["black"]][[1]])
+tophit=c(20,20,10,10)
+genes_blue <- c(intersect(Hubgenes[["blue"]][[1]][1:tophit[1],]$gene, Hubgenes[["blue"]][[2]][1:tophit[1],]$gene))
+genes_brown <- intersect(Hubgenes[["brown"]][[1]][1:tophit[2],]$gene, Hubgenes[["brown"]][[2]][1:tophit[2],]$gene)
+genes_red <- intersect(Hubgenes[["red"]][[1]][1:tophit[3],]$gene, Hubgenes[["red"]][[2]][1:tophit[3],]$gene)
+# genes_cyan <- intersect(Hubgenes[["cyan"]][[1]][1:tophit[4],]$gene, Hubgenes[["cyan"]][[2]][1:tophit[4],]$gene)
+genes_black <- intersect(Hubgenes[["black"]][[1]][1:tophit[4],]$gene, Hubgenes[["black"]][[2]][1:tophit[4],]$gene)
+
+
+c(intersect(Hubgenes[["blue"]][[1]]$gene, Hubgenes[["blue"]][[2]]$gene))
+c(intersect(Hubgenes[["brown"]][[1]]$gene, Hubgenes[["brown"]][[2]]$gene))
+
+## list of all hub genes
+hub_genes <- rbind(data.frame(gene=genes_blue,module=rep("blue",length(genes_blue))),
+                   data.frame(gene=genes_brown,module=rep("brown",length(genes_brown))),
+                   data.frame(gene=genes_red,module=rep("red",length(genes_red))),
+                   data.frame(gene=genes_black,module=rep("black",length(genes_black))))%>%
+  filter(!is.na(gene)) %>%
+  filter(gene %in% anno_coding$gene_symbol)
+
+write.csv(hub_genes,paste0(output,"general_output/Common_Hubgenes_raw.csv"))
+hub_genes
+# heatmaply_cor(x = cor(multiExpr[[2]]$data[,hub_genes$gene]),
+#               xlab = "Features",
+#               ylab = "Features",
+#               k_col = 2,
+#               k_row = 2)
+```
+
+
+# 7. Boostrap to get most importatnt in prediction 
+
+```{r eval=FALSE, include=FALSE}
+library(glmnet)
+library(doParallel)
+library(foreach)
+library(gglasso)
+library(doSNOW)
+## registry cores to cluster
+cl <- makeCluster(24,type='SOCK')
+#registerDoParallel(cl)
+registerDoSNOW(cl)
+
+## data HIV pos
+hist(data_HIVpos)
+data_HIVpos <-rbind(Traits[[1]]$data,Traits[[2]]$data) %>%
+  subset(Study =="26TB") %>% 
+  mutate(Treatment = case_when(Treatment=="control" ~ 0, 
+                               Treatment=="case" ~ 1)) %>%
+  mutate(Log_CSF_Lymp= log10(totalcsflympho),
+         Log_BL_Neu= totalneutrobl)
+colnames(data_HIVpos)[which(colnames(data_HIVpos)=="CD4")] <- "CD4_cells"
+table(data_HIVpos$Treatment)
+
+## fill 1 NA CSF lympho by mean of survivors group
+Log_CSF_Lymp_mean <- data_HIVpos %>% group_by(evdeath_3M) %>%
+  dplyr::summarise(Mean = mean(Log_CSF_Lymp, na.rm = T)) %>% as.data.frame()
+data_HIVpos$Log_CSF_Lymp[which(is.na(data_HIVpos$Log_CSF_Lymp))] <- 
+  round(Log_CSF_Lymp_mean$Mean[which(Log_CSF_Lymp_mean$evdeath_3M==0)],1)
+
+# data HIV neg
+data_HIVneg <-rbind(Traits[[1]]$data,Traits[[2]]$data) %>%
+  subset(Study =="27TB") %>%
+  mutate(Treatment = case_when(Treatment=="control" ~ 0, 
+                               Treatment=="case" ~ 1)) %>%
+  mutate(Log_CSF_Lymp= log10(totalcsflympho),
+         Log_BL_Neu= totalneutrobl)
+colnames(data_HIVneg)[which(colnames(data_HIVneg)=="CD4")] <- "CD4_cells"
+table(data_HIVneg$Treatment)
+## fill 1 NA Blood Neutro by mean of nonsurvival
+Log_BL_Neu_mean <- data_HIVneg %>% group_by(evdeath_3M) %>%
+  dplyr::summarise(Mean = mean(Log_BL_Neu, na.rm = T)) %>% as.data.frame()
+# event_group <- data_HIVneg$evdeath_3M[which(is.na(data_HIVneg$totalneutrobl))]
+data_HIVneg$Log_BL_Neu[which(is.na(data_HIVneg$Log_BL_Neu) & data_HIVneg$evdeath_3M==1)] <- round(Log_BL_Neu_mean$Mean[which(Log_BL_Neu_mean$evdeath_3M==1)],1)
+data_HIVneg$Log_BL_Neu[which(is.na(data_HIVneg$Log_BL_Neu) & data_HIVneg$evdeath_3M==0)] <- round(Log_BL_Neu_mean$Mean[which(Log_BL_Neu_mean$evdeath_3M==0)],1)
+```
+
+```{r }
+library(glmnet)
+library(doParallel)
+library(foreach)
+library(gglasso)
+library(doSNOW)
+## registry cores to cluster
+cl <- makeCluster(24,type='SOCK')
+#registerDoParallel(cl)
+registerDoSNOW(cl)
+
+dev.off()
+## data HIV pos
+data_HIVpos <-rbind(Traits[[1]]$data,Traits[[2]]$data) %>%
+  subset(Study =="26TB") %>% 
+  mutate(Treatment = case_when(Treatment=="control" ~ 0, 
+                               Treatment=="case" ~ 1)) %>%
+  mutate(Log_CSF_Lymp= log10(totalcsflympho),
+         Log_BL_Neu= log10(totalneutrobl))
+colnames(data_HIVpos)[which(colnames(data_HIVpos)=="CD4")] <- "CD4_cells"
+table(data_HIVpos$Treatment)
+
+## fill 1 NA CSF lympho by mean of survivors group
+data_HIVpos$Log_CSF_Lymp[which(is.na(data_HIVpos$Log_CSF_Lymp))] <- 
+  mean(data_HIVpos$Log_CSF_Lymp,na.rm=T)
+
+# data HIV neg
+data_HIVneg <-rbind(Traits[[1]]$data,Traits[[2]]$data) %>%
+  subset(Study =="27TB") %>%
+  mutate(Treatment = case_when(Treatment=="control" ~ 0, 
+                               Treatment=="case" ~ 1)) %>%
+  mutate(Log_CSF_Lymp= log10(totalcsflympho),
+         Log_BL_Neu= log10(totalneutrobl))
+colnames(data_HIVneg)[which(colnames(data_HIVneg)=="CD4")] <- "CD4_cells"
+table(data_HIVneg$Treatment)
+data_HIVneg$Log_BL_Neu[which(is.na(data_HIVneg$Log_BL_Neu))] <- mean(data_HIVneg$Log_BL_Neu,na.rm=T)
+hist(log10(data_HIVneg$Log_BL_Neu))
+
+```
+
+
+```{r}
+Expr_All <- get(load(file="../General_analysis/RData/gene_clini_adjusted_ComBat_all.Rdata"))
+rownames(Expr_All) <- Expr_All$LIMS_ID
+clini_index <- 1:which(names(Expr_All)=="Run")
+Expr_All = as.data.frame(Expr_All[, -c(clini_index)])
+cox_HIVpos <- Expr_All[rownames(data_HIVpos),] %>% as.matrix()
+cox_HIVneg <- Expr_All[rownames(data_HIVneg),] %>% as.matrix()
+dim(cox_HIVneg)
+
+specific_hub_selected <- read.csv("WGCNA/All_study/Consensus_TBM/General_DEX/general_output/Specific_consensus_hubgenes.csv")
+specific_HIVneg <- specific_hub_selected %>%
+  filter(module=="yellow") %>%
+  dplyr::select(gene,module) %>%
+  dplyr::mutate(set="HIVneg-specific")
+specific_HIVpos <- specific_hub_selected %>%
+  filter(module=="blue") %>%
+  dplyr::select(gene,module) %>%
+  dplyr::mutate(set="HIVpos-specific")
+
+#colnames(cox_HIVpos)
+colnames(data_HIVpos)
+table(data_HIVpos$Log_CSF_Lymp)
+input_clini <- c("AGE","TBMGRADE","Log_CSF_Lymp","Log_BL_Neu")
+
+table(data_HIVpos$Treatment)
+
+
+table(rownames(cox_HIVpos) == rownames(data_HIVpos))
+dim(data_HIVpos)
+system.time({
+  set.seed(12345)
+  Hubgen_freq_HIVpos <- lasso_cox_boost(x=cox_HIVpos, y =data_HIVpos, 
+                                        dat_hubgenes = rbind(hub_genes[,c("gene","module")],
+                                                             specific_HIVpos[,c("gene","module")]),
+                                        clini_vars = input_clini,evdays=97,
+                                        n=nrow(data_HIVpos),
+                                        B=1000, lambda.1se = F, nfolds=3,
+                                        alpha = 0.5,Multi = F)
+})
+
+
+
+## selected gene for HIV negative
+dim(data_HIVneg)
+
+system.time({
+  set.seed(12345)
+  Hubgen_freq_HIVneg <- lasso_cox_boost(x=cox_HIVneg, y =data_HIVneg, 
+                                        dat_hubgenes = rbind(hub_genes[,c("gene","module")],
+                                                             specific_HIVneg[,c("gene","module")]), 
+                                        clini_vars = input_clini,evdays=97,
+                                        n=nrow(data_HIVneg),
+                                        B=1000, lambda.1se = F, nfolds=3,
+                                        alpha = 0.5,Multi = F)
+})
+
+
+
+Hubgen_freq_HIVneg
+Hubgen_freq_HIVpos
+
+```
+
+
+### get HZ CI for clinical risk factors
+```{r}
+evdays=97
+names(data_HIVneg)
+data_HIVneg$TBMGRADE
+# TBM grade
+fit <- coxph(Surv(pmin(ttdeath,evdays),ifelse(ttdeath<=evdays,evdeath,0))~TBMGRADE, data =data_HIVneg)
+summary(fit)
+fit <- coxph(Surv(pmin(ttdeath,evdays),ifelse(ttdeath<=evdays,evdeath,0))~TBMGRADE, data =data_HIVpos)
+summary(fit)
+
+## AGE
+fit <- coxph(Surv(pmin(ttdeath,evdays),ifelse(ttdeath<=evdays,evdeath,0))~I(AGE/10), data =data_HIVneg)
+summary(fit)
+fit <- coxph(Surv(pmin(ttdeath,evdays),ifelse(ttdeath<=evdays,evdeath,0))~I(AGE/10), data =data_HIVpos)
+summary(fit)
+
+summary(data_HIVneg$AGE)
+summary(data_HIVpos$AGE)
+
+## Lymphocytes
+fit <- coxph(Surv(pmin(ttdeath,evdays),ifelse(ttdeath<=evdays,evdeath,0))~Log_CSF_Lymp, data =data_HIVneg)
+summary(fit)
+fit <- coxph(Surv(pmin(ttdeath,evdays),ifelse(ttdeath<=evdays,evdeath,0))~Log_CSF_Lymp, data =data_HIVpos)
+summary(fit)
+```
+
+
+
+```{r eval=FALSE, include=FALSE}
+system.time({
+  set.seed(01234)
+  Hubgen_freq_HIVpos_genes <- lasso_cox_boost(x=cox_HIVpos, y =data_HIVpos, 
+                                        dat_hubgenes = rbind(hub_genes,
+                                                             specific_HIVpos),
+                                        clini_vars = NULL,evdays=97,
+                                        n=nrow(data_HIVpos),
+                                        B=1000, lambda.1se = F, nfolds=3,
+                                        alpha = 0.5,Multi = F)
+})
+
+
+## selected gene for HIV negative
+dim(data_HIVneg)
+
+system.time({
+  set.seed(01234)
+  Hubgen_freq_HIVneg_genes <- lasso_cox_boost(x=cox_HIVneg, y =data_HIVneg, 
+                                        dat_hubgenes = rbind(hub_genes,
+                                                             specific_HIVneg), 
+                                        clini_vars = NULL,evdays=97,
+                                        n=nrow(data_HIVneg),
+                                        B=1000, lambda.1se = F, nfolds=3,
+                                        alpha = 0.5,Multi = F)
+})
+Hubgen_freq_HIVpos_genes
+Hubgen_freq_HIVneg_genes
+```
+
+### get HR CI and Pvalue for genes
+
+```{r}
+n=97
+Genes <- c()
+pvalue <- c()
+HR <- c()
+up_CI <- c()
+low_CI <- c()
+
+all(rownames(cox_HIVneg) == rownames(data_HIVneg))
+df_cox_HIVneg <- cbind(cox_HIVneg,data_HIVneg)
+
+gene_list <- c("MCEMP1","FCAR","ETS2","PGD","NELL2","TRABD2A","TRAF5",
+               "CD28","TESPA1","ABLIM1","RASGRP1")
+i=gene_list[1]
+for (i in gene_list){
+  # print(i)
+  epr <- paste0("fit <- coxph(Surv(pmin(ttdeath,n),ifelse(ttdeath<=n,evdeath,0))~", i , 
+                ",data =df_cox_HIVneg)")
+  eval(parse( text=epr ))
+  epr <- paste0("summary(fit)")
+  ts <- (eval(parse( text=epr )))
+  tp <- ts$coefficients[1,5]
+  th <- ts$conf.int[1,1]
+  thup <- ts$conf.int[1,3]
+  thdown <- ts$conf.int[1,4]
+  pvalue <- c(pvalue,tp)
+  HR <- c(HR,th)
+  up_CI <- c(up_CI,thup)
+  low_CI <- c(low_CI,thdown)
+  Genes <- c(Genes,i)
+  
+}
+result_uni_cox <- data.frame(Genes,HR,low_CI, up_CI,pvalue) %>%
+  dplyr::mutate(HR=round(HR,2),
+                low_CI=round(low_CI,2),
+                up_CI=round(up_CI,2),
+                pvalue=format(pvalue,scientific = T,digits =3))
+output
+getwd()
+write.csv(result_uni_cox,paste0(output,"/general_output/Uni_Cox_HubGenes_3M_Mortality_TBMHIVneg_RNAseq.csv"))
+```
+
+
+```{r eval=FALSE, include=FALSE}
+### export hub gene
+hub_genes %<>% mutate(set="common")
+specific_HIVpos %<>% mutate(set="HIV-infected")
+specific_HIVneg %<>% mutate(set="HIV-uninfected")
+
+# draw KM plot for target genes
+library(survminer)
+#tail(names(df_cox_list[[set]]))
+gene_list <- unique(c(hub_genes$gene,specific_HIVneg$gene,specific_HIVpos$gene))
+# gene_list <- "AP003086.1"
+study_list <- c("TBM_HIVneg","TBM_HIVpos")
+df_cox_list <- list(TBM_HIVneg=cbind(cox_HIVneg,data_HIVneg), TBM_HIVpos=cbind(cox_HIVpos,data_HIVpos))
+cox_hub_genes <- list()
+for (set in 1:2) {
+  print(paste0("process set: ",study_list[set]))
+  temp_cox <- NULL
+  data_cox <- NULL
+  for (gene in gene_list) {
+    print(gene)
+    temp_d <- export_KM_genes(data=df_cox_list[[set]],gene = gene,covar = NULL, output = NULL, 
+                              name = NULL,plot_export=F)
+    temp_cox <- rbind(temp_cox,temp_d)
+    cox_hub_genes[[set]] = list(data=temp_cox)
+  }
+}
+
+
+# names(Hubgen_freq_HIVpos_export)
+## export genes selected
+Hubgen_freq_HIVneg_export <- merge(Hubgen_freq_HIVneg, rbind(hub_genes,specific_HIVneg), by="gene", all.x=T) %>%
+  merge(.,cox_hub_genes[[1]]$data, by="gene", all.x=T) %>%
+   mutate(Module_set= ifelse(is.na(set), "clinical predictor",paste0(module, ", ",set))) %>%
+  dplyr::select(gene,freq,Module_set,range_gene,HZ) %>%
+  dplyr::arrange(freq) 
+
+Hubgen_freq_HIVpos_export <- merge(Hubgen_freq_HIVpos, rbind(hub_genes,specific_HIVpos), by="gene",all.x=T) %>%
+  merge(.,cox_hub_genes[[2]]$data, by="gene", all.x=T) %>%
+  mutate(Module_set= ifelse(is.na(set), "clinical predictor",paste0(module, ", ",set))) %>%
+  dplyr::select(gene,freq,Module_set,range_gene,HZ) %>%
+  dplyr::arrange(freq)
+
+write.csv(Hubgen_freq_HIVpos_export, paste0(output,"general_output/Hubgen_freq_HIVpos_export_with_neuto.csv"))
+write.csv(Hubgen_freq_HIVneg_export, paste0(output,"general_output/Hubgen_freq_HIVneg_export_with_neuto.csv"))
+
+```
+
+# 8. Boostrap AUC performance and Calibration slope
+## Functions and data
+
+```{r}
+library(riskRegression)
+library(stringr)
+# function to calculate AUC CI with bootstrap 
+
+glm_auc <- function(formula,data, B){
+  fit <- glm(formula, data = data, family=binomial(link="logit")) # Fit model on orginal data
+  #summary(fit)
+  prob_orig <- predict(fit, data, type="response")# predict y from the above model
+  pred_orig <- ROCR::prediction(prob_orig, data$evdeath_3M)
+  auc_pef_orig <- ROCR::performance(pred_orig, measure="auc")
+  auc_orig <- round(auc_pef_orig@y.values[[1]],3)# AUC orginal data
+  n <- nrow(data)
+  index <- sample(n, n*B, replace = T)
+  dim(index) <- c(n,B)
+  auc_boot <- NULL
+  auc_boot_orig <- NULL
+  auc_corrected <- NULL
+  o <- NULL
+  #data_auc <- NULL ### what is it used for?
+  num_warn <- 0
+  num_error <- 0
+  
+  err <- NULL
+  i=1
+  for (i in 1:B){
+    cat("\r", i, "of", B)#### what is this?
+    flush.console() ### what is this
+    boot.data <- data[index[,i],]
+    tryCatch({
+      g <- glm(formula, family=binomial(link="logit"), data=boot.data)
+      prob <- predict(g, boot.data, type="response")
+      pred <- ROCR::prediction(prob, boot.data$evdeath_3M)
+      auc_pef <- ROCR::performance(pred, measure="auc")
+      auc_boot[i] <- round(auc_pef@y.values[[1]],3)
+      
+      prob_boot <- predict(g, data, type="response")
+      pred_boot <- ROCR::prediction(prob_boot, data$evdeath_3M)
+      auc_pef_boot <- ROCR::performance(pred_boot, measure="auc")
+      auc_boot_orig[i] <- round(auc_pef_boot@y.values[[1]],3) 
+      o[i] <- auc_boot[i] - auc_boot_orig[i]
+      auc_corrected[i] <- auc_orig - o[i] 
+    },
+    error = function(e)
+    {
+      auc_boot[i]<<- NA
+      num_error <<- num_error + 1
+      
+    },
+    warning = function(warn)
+    {
+      auc_boot[i]<<- NA
+      num_warn <<- num_warn + 1
+      
+    }
+    )
+  }
+  median_cor_auc = median(auc_corrected, na.rm = TRUE)
+  mean_cor_auc = mean(auc_corrected, na.rm = TRUE)
+  ci.025 = quantile(auc_corrected, 0.025, na.rm = TRUE)
+  ci.975 = quantile(auc_corrected, 0.975, na.rm = TRUE)
+  num_actual = B - num_warn 
+  tab_cor_auc <- data.frame(
+    median_cor_auc = median_cor_auc,
+    mean_cor_auc = mean_cor_auc,
+    ci.025 = ci.025, ## should we convert it to value?
+    ci.975 = ci.975,
+    number_actual = B-num_warn ## 
+  )
+  auc_corrected <- auc_corrected ## can we remove it, depends?
+  rownames(tab_cor_auc) <- "Value" ## ahihi
+  return(list(tab_cor_auc, num_warn ,num_error,
+              auc_boot_orig, auc_boot, auc_corrected, o))
+}
+
+
+# function to get summary AUC
+AUC_summary <- function(formula,data,B = 1000,seed=12345, round.digit=2){
+  set.seed(seed)
+  model_glm <- glm_auc(formula, data, B = B)
+  corrected.AUC = paste0(round(model_glm[[1]]["median_cor_auc"],round.digit),
+                         " (",
+                         round(model_glm[[1]]["ci.025"],round.digit), 
+                         "-",
+                         round(model_glm[[1]]["ci.975"],round.digit)
+                         , ")")
+  return(corrected.AUC)
+  }
+
+```
+
+
+```{r}
+#data set for HIVneg
+names(data_HIVneg)
+data_HIVneg$SODIUM
+hist(log10(data_HIVneg$totalneutrobl))
+hist(log10(data_HIVneg$CSFLYMTOT))
+hist(data_HIVneg$CSFLYMTOT)
+
+#data set for HIVneg
+df_HIVneg = cbind(cox_HIVneg,data_HIVneg) %>%
+  mutate(status = factor(evdeath_3M, levels = c(0,1), labels = c("No","Yes")),
+         Log_CSF_Lymp=log10(CSFLYMTOT),
+          Log_BL_Neu= totalneutrobl,
+         History_TBT=factor(History_TBT,levels = c("N","Y")),
+         FOCAL_Neuro=factor(FOCAL_Neuro,levels = c("N","Y"))) %>%
+  filter(!(evdeath_3M == 0 & ttdeath < 97)) %>%
+  dplyr::select( "MCEMP1","TRABD2A","NELL2","PKD1","ZNF354C","CD4","BCL9L",
+                 "evdeath_3M",  "AGE", "History_TBT","TBMGRADE" ,"WEIGHT", "FOCAL_Neuro",
+                 "CSFLYMTOT","Log_CSF_Lymp","Log_BL_Neu","CD4_cells","SODIUM","status")  %>%
+  dplyr::mutate(study="27TB",
+                History_TBT=case_when(is.na(History_TBT)~"N",
+                                      TRUE~History_TBT))
+
+#data set for HIVpos
+df_HIVpos = cbind(cox_HIVpos,data_HIVpos) %>%
+  mutate(status = factor(evdeath_3M, levels = c(0,1), labels = c("No","Yes")),
+         Log_CSF_Lymp=log10(CSFLYMTOT),
+         History_TBT=factor(History_TBT,levels = c("N","Y")),
+         FOCAL_Neuro=factor(FOCAL_Neuro,levels = c("N","Y"))) %>%
+  filter(!(evdeath_3M == 0 & ttdeath < 97)) %>%
+  dplyr::select( "MCEMP1","TRABD2A","NELL2","PKD1","ZNF354C","CD4","BCL9L",
+                 "evdeath_3M",  "AGE", "History_TBT","TBMGRADE" ,"WEIGHT", "FOCAL_Neuro",
+                 "CSFLYMTOT","Log_CSF_Lymp","Log_BL_Neu","CD4_cells","SODIUM","status") %>%
+  dplyr::mutate(study="26TB")
+## fill 1 NA csflymtot by mean of group survival
+df_HIVpos$Log_CSF_Lymp[which(is.na(df_HIVpos$Log_CSF_Lymp))] <- mean(df_HIVpos$Log_CSF_Lymp, na.rm = T)
+df_HIVpos$CD4_cells[which(is.na(df_HIVpos$CD4_cells))] <- mean(df_HIVpos$CD4_cells, na.rm = T)
+
+## fill 1 NA Blood Neutro by mean of group survival
+df_HIVneg$Log_BL_Neu[which(is.na(df_HIVneg$Log_BL_Neu))] <- mean(df_HIVneg$Log_BL_Neu, na.rm = T)
+df_HIVneg$SODIUM[which(is.na(df_HIVneg$SODIUM))] <- mean(df_HIVneg$SODIUM, na.rm = T)
+
+
+## all TBM data
+df_All <- rbind(df_HIVneg,df_HIVpos)
+dim(df_HIVneg);dim(df_HIVpos)
+
+AUC_df_RNAseq <- df_All
+save(AUC_df_RNAseq,file = "fluidigm/RData/AUC_df_RNAseq.RData")
+
+```
+
+
+```{r}
+#install.packages("riskRegression")
+library("riskRegression")
+library(rms)
+set.seed(12345)
+df_HIVneg %<>% dplyr::select(-CD4_cells)
+dd1 <- datadist(df_All); options( datadist = "dd1")
+dd2 <- datadist(df_HIVneg); options( datadist = "dd2")
+dd3 <- datadist(df_HIVpos); options( datadist = "dd3")
+
+```
+
+## Model 0: Thao model 
+
+```{r}
+## create formula 0
+
+table(df_All$History_TBT)
+formula = evdeath_3M ~ AGE + History_TBT + TBMGRADE + Log_CSF_Lymp 
+
+# fit = glm(formula, data = df_All,family = "binomial")
+# warning()
+# summary(fit)
+
+# Fit model model 0 All TBM
+model<- lrm(formula, data = df_All, x = TRUE, y = TRUE )
+M0_All <- validate(model,  B = 1000)
+M0_All_CI <- AUC_summary(formula,df_All, B = 1000)
+
+# Fit model model 0 HIVneg
+model<- lrm(formula, data = df_HIVneg, x = TRUE, y = TRUE )
+M0_HIVneg <- validate(model,  B = 1000)
+M0_HIVneg_CI <- AUC_summary(formula,df_HIVneg, B = 1000)
+
+# Fit model model 0 HIV positive
+formula = evdeath_3M ~  WEIGHT + TBMGRADE + Log_CSF_Lymp + SODIUM + CD4_cells
+
+
+model<- lrm(formula, data = df_HIVpos, x = TRUE, y = TRUE )
+M0_HIVpos <- validate(model,  B = 1000)
+M0_HIVpos_CI <- AUC_summary(formula,df_HIVpos, B = 1000)
+```
+
+
+
+
+## Model 1: MCEMP1 + TRABD2A + CD4
+
+
+```{r}
+## create formula 1
+formula = evdeath_3M ~ MCEMP1 + TRABD2A + CD4 #PKD1 
+
+# Fit model model 1 All TBM
+model<- lrm(formula, data = df_All, x = TRUE, y = TRUE )
+M1_All <- validate(model,  B = 1000)
+M1_All_CI <- AUC_summary(formula,df_All, B = 1000)
+
+# Fit model model 1 HIVneg
+model<- lrm(formula, data = df_HIVneg, x = TRUE, y = TRUE )
+M1_HIVneg <- validate(model,  B = 1000)
+M1_HIVneg_CI <- AUC_summary(formula,df_HIVneg, B = 1000)
+
+# Fit model model 1 HIV positive
+model<- lrm(formula, data = df_HIVpos, x = TRUE, y = TRUE )
+M1_HIVpos <- validate(model,  B = 1000)
+M1_HIVpos_CI <- AUC_summary(formula,df_HIVpos, B = 1000)
+```
+
+## Model 2: MCEMP1 + NELL2 + ZNF354C
+ 
+```{r}
+## create formula 2
+formula = evdeath_3M ~ MCEMP1 + NELL2 + ZNF354C
+
+# Fit model model 2 All TBM
+model<- lrm(formula, data = df_All, x = TRUE, y = TRUE )
+M2_All <- validate(model,  B = 1000)
+M2_All_CI <- AUC_summary(formula,df_All, B = 1000)
+
+# Fit model model 2 HIVneg
+model<- lrm(formula, data = df_HIVneg, x = TRUE, y = TRUE )
+M2_HIVneg <- validate(model,  B = 1000)
+M2_HIVneg_CI <- AUC_summary(formula,df_HIVneg, B = 1000)
+
+# Fit model model 2 HIV positive
+model<- lrm(formula, data = df_HIVpos, x = TRUE, y = TRUE )
+M2_HIVpos <- validate(model,  B = 1000)
+M2_HIVpos_CI <- AUC_summary(formula,df_HIVpos, B = 1000)
+```
+
+
+## Model 3: MCEMP1 + TRABD2A +  CD4 + AGE + TBMGRADE + Log_CSF_Lymp
+
+```{r}
+## create formula 3
+formula = evdeath_3M ~ MCEMP1 + TRABD2A +  CD4 + AGE + TBMGRADE + Log_CSF_Lymp
+
+# Fit model model 3 All TBM
+model<- lrm(formula, data = df_All, x = TRUE, y = TRUE )
+M3_All <- validate(model,  B = 1000)
+M3_All_CI <- AUC_summary(formula,df_All, B = 1000)
+
+# Fit model model 3 HIVneg
+model<- lrm(formula, data = df_HIVneg, x = TRUE, y = TRUE )
+M3_HIVneg <- validate(model,  B = 1000)
+M3_HIVneg_CI <- AUC_summary(formula,df_HIVneg, B = 1000)
+
+# Fit model model 3 HIV positive
+model<- lrm(formula, data = df_HIVpos, x = TRUE, y = TRUE )
+M3_HIVpos <- validate(model,  B = 1000)
+M3_HIVpos_CI <- AUC_summary(formula,df_HIVpos, B = 1000)
+```
+
+## Model 4: MCEMP1 + NELL2 + ZNF354C + AGE + TBMGRADE + Log_CSF_Lymp
+
+```{r}
+## create formula 4
+set.seed(0)
+formula = evdeath_3M ~ MCEMP1 + NELL2 + ZNF354C + AGE + TBMGRADE+Log_CSF_Lymp
+
+# Fit model model 4 All TBM
+model<- lrm(formula, data = df_All, x = TRUE, y = TRUE )
+M4_All <- validate(model,  B = 1000)
+M4_All_CI <- AUC_summary(formula,df_All, B = 1000)
+
+# Fit model model 4 HIVneg
+model<- lrm(formula, data = df_HIVneg, x = TRUE, y = TRUE )
+M4_HIVneg <- validate(model,  B = 1000)
+M4_HIVneg_CI <- AUC_summary(formula,df_HIVneg, B = 1000)
+
+# Fit model model 4 HIV positive
+model<- lrm(formula, data = df_HIVpos, x = TRUE, y = TRUE )
+M4_HIVpos <- validate(model,  B = 1000)
+M4_HIVpos_CI <- AUC_summary(formula,df_HIVpos, B = 1000)
+```
+
+
+## Model 5: MCEMP1 + TRABD2A +  CD4 + ZNF354C
+
+```{r}
+## create formula 5
+formula = evdeath_3M ~ MCEMP1 + TRABD2A +  CD4 + ZNF354C
+
+# Fit model model 5 All TBM
+model<- lrm(formula, data = df_All, x = TRUE, y = TRUE )
+M5_All <- validate(model,  B = 1000)
+M5_All_CI <- AUC_summary(formula,df_All, B = 1000)
+
+# Fit model model 5 HIVneg
+model<- lrm(formula, data = df_HIVneg, x = TRUE, y = TRUE )
+M5_HIVneg <- validate(model,  B = 1000)
+M5_HIVneg_CI <- AUC_summary(formula,df_HIVneg, B = 1000)
+
+# Fit model model 5 HIV positive
+model<- lrm(formula, data = df_HIVpos, x = TRUE, y = TRUE )
+M5_HIVpos <- validate(model,  B = 1000)
+M5_HIVpos_CI <- AUC_summary(formula,df_HIVpos, B = 1000)
+```
+
+## Model 6: MCEMP1 + NELL2 +  CD4 + ZNF354C
+
+```{r}
+## create formula 6
+set.seed(0)
+formula = evdeath_3M ~ MCEMP1 + NELL2 +  CD4 + ZNF354C
+
+# Fit model model 6 All TBM
+model<- lrm(formula, data = df_All, x = TRUE, y = TRUE )
+M6_All <- validate(model,  B = 1000)
+M6_All_CI <- AUC_summary(formula,df_All, B = 1000)
+
+# Fit model model 6 HIVneg
+model<- lrm(formula, data = df_HIVneg, x = TRUE, y = TRUE )
+M6_HIVneg <- validate(model,  B = 1000)
+M6_HIVneg_CI <- AUC_summary(formula,df_HIVneg, B = 1000)
+
+# Fit model model 6 HIV positive
+model<- lrm(formula, data = df_HIVpos, x = TRUE, y = TRUE )
+M6_HIVpos <- validate(model,  B = 1000)
+M6_HIVpos_CI <- AUC_summary(formula,df_HIVpos, B = 1000)
+```
+
+
+## Model 7: MCEMP1 + TRABD2A +  CD4 + ZNF354C + AGE + TBMGRADE + Log_CSF_Lymp
+
+```{r}
+## create formula 7
+formula = evdeath_3M ~ MCEMP1 + TRABD2A +  CD4 + ZNF354C + AGE + TBMGRADE +Log_CSF_Lymp
+
+# Fit model model 7 All TBM
+model<- lrm(formula, data = df_All, x = TRUE, y = TRUE )
+M7_All <- validate(model,  B = 1000)
+M7_All_CI <- AUC_summary(formula,df_All, B = 1000)
+
+# Fit model model 7 HIVneg
+model<- lrm(formula, data = df_HIVneg, x = TRUE, y = TRUE )
+M7_HIVneg <- validate(model,  B = 1000)
+M7_HIVneg_CI <- AUC_summary(formula,df_HIVneg, B = 1000)
+
+# Fit model model 7 HIV positive
+model<- lrm(formula, data = df_HIVpos, x = TRUE, y = TRUE )
+M7_HIVpos <- validate(model,  B = 1000)
+M7_HIVpos_CI <- AUC_summary(formula,df_HIVpos, B = 1000)
+```
+
+## Model 8: MCEMP1 + NELL2 +  CD4 + ZNF354C + AGE + TBMGRADE + Log_CSF_Lymp
+
+```{r}
+## create formula 8
+set.seed(0)
+formula = evdeath_3M ~ MCEMP1 + NELL2 +  CD4 + ZNF354C + AGE + TBMGRADE + Log_CSF_Lymp
+
+# Fit model model 8 All TBM
+model<- lrm(formula, data = df_All, x = TRUE, y = TRUE )
+M8_All <- validate(model,  B = 1000)
+M8_All_CI <- AUC_summary(formula,df_All, B = 1000)
+
+# Fit model model 8 HIVneg
+model<- lrm(formula, data = df_HIVneg, x = TRUE, y = TRUE )
+M8_HIVneg <- validate(model,  B = 1000)
+M8_HIVneg_CI <- AUC_summary(formula,df_HIVneg, B = 1000)
+
+# Fit model model 8 HIV positive
+model<- lrm(formula, data = df_HIVpos, x = TRUE, y = TRUE )
+M8_HIVpos <- validate(model,  B = 1000)
+M8_HIVpos_CI <- AUC_summary(formula,df_HIVpos, B = 1000)
+```
+
+
+## Model 9 & 10: Neutrophil only
+
+```{r}
+## create formula 9
+names(df_All)
+set.seed(0)
+formula = evdeath_3M ~ Log_BL_Neu
+
+# Fit model model 8 All TBM
+model<- lrm(formula, data = df_All, x = TRUE, y = TRUE )
+M9_All <- validate(model,  B = 1000)
+M9_All_CI <- AUC_summary(formula,df_All, B = 1000)
+
+# Fit model model 8 HIVneg
+model<- lrm(formula, data = df_HIVneg, x = TRUE, y = TRUE )
+M9_HIVneg <- validate(model,  B = 1000)
+M9_HIVneg_CI <- AUC_summary(formula,df_HIVneg, B = 1000)
+
+# Fit model model 8 HIV positive
+model<- lrm(formula, data = df_HIVpos, x = TRUE, y = TRUE )
+M9_HIVpos <- validate(model,  B = 1000)
+M9_HIVpos_CI <- AUC_summary(formula,df_HIVpos, B = 1000)
+```
+
+
+
+```{r}
+## create formula 10
+names(df_All)
+set.seed(0)
+formula = evdeath_3M ~ AGE + TBMGRADE + Log_CSF_Lymp + Log_BL_Neu
+
+# Fit model model 8 All TBM
+model<- lrm(formula, data = df_All, x = TRUE, y = TRUE )
+M10_All <- validate(model,  B = 1000)
+M10_All_CI <- AUC_summary(formula,df_All, B = 1000)
+
+# Fit model model 8 HIVneg
+model<- lrm(formula, data = df_HIVneg, x = TRUE, y = TRUE )
+M10_HIVneg <- validate(model,  B = 1000)
+M10_HIVneg_CI <- AUC_summary(formula,df_HIVneg, B = 1000)
+
+# Fit model model 8 HIV positive
+model<- lrm(formula, data = df_HIVpos, x = TRUE, y = TRUE )
+M10_HIVpos <- validate(model,  B = 1000)
+M10_HIVpos_CI <- AUC_summary(formula,df_HIVpos, B = 1000)
+```
+
+```{r eval=FALSE, include=FALSE}
+
+model_col <- c("Predictors:Blood Neutrophil",
+               "All and Neutrophil")
+## All TBM
+AUC_All <- c(M9_All[,"index.corrected"]["Dxy"],
+             M10_All[,"index.corrected"]["Dxy"])
+AUC_All = AUC_All/2 + 0.5
+
+Calib_All <- c(M9_All[,"index.corrected"]["Slope"],
+               M10_All[,"index.corrected"]["Slope"])
+
+Brier_All <- c(M9_All[,"index.corrected"]["B"],
+               M10_All[,"index.corrected"]["B"])
+
+# TBM HIV negative
+
+AUC_HIVneg <- c(M9_HIVneg[,"index.corrected"]["Dxy"],
+                M10_HIVneg[,"index.corrected"]["Dxy"])
+AUC_HIVneg = AUC_HIVneg/2 + 0.5
+
+Calib_HIVneg <- c(M9_HIVneg[,"index.corrected"]["Slope"],
+                  M10_HIVneg[,"index.corrected"]["Slope"])
+
+Brier_HIVneg <- c(M9_HIVneg[,"index.corrected"]["B"],
+                  M10_HIVneg[,"index.corrected"]["B"])
+
+# TBM HIV positive
+AUC_HIVpos <- c(M9_HIVpos[,"index.corrected"]["Dxy"],
+                M10_HIVpos[,"index.corrected"]["Dxy"])
+AUC_HIVpos = AUC_HIVpos/2 + 0.5
+
+Calib_HIVpos <- c(M9_HIVpos[,"index.corrected"]["Slope"],
+                  M10_HIVpos[,"index.corrected"]["Slope"])
+
+Brier_HIVpos <- c(M9_HIVpos[,"index.corrected"]["B"],
+                  M10_HIVpos[,"index.corrected"]["B"])
+
+
+summary_AUC <- data.frame(Predictor_set = model_col,AUC_All=AUC_All, Calib_All=Calib_All, Brier_All=Brier_All,
+           AUC_HIVneg=AUC_HIVneg, Calib_HIVneg=Calib_HIVneg, Brier_HIVneg=Brier_HIVneg,
+           AUC_HIVpos=AUC_HIVpos, Calib_HIVpos=Calib_HIVpos, Brier_HIVpos=Brier_HIVpos)
+summary_AUC
+
+#write.csv(summary_AUC, paste0(output,"general_output/","summary_AUC_for_selected_genes_Neutrophil_and_All.csv"))
+
+```
+
+
+## Sumary AUC models
+
+```{r eval=FALSE, include=FALSE}
+
+model_col <- c("Thao Model",
+               "Predictors: MCEMP1, TRABD2A, and CD4",
+               "Predictors: MCEMP1 ,NELL2 and ZNF354C",
+               "Predictors: MCEMP1, TRABD2A, CD4 and clinical predictors",
+               "Predictors: MCEMP1 ,NELL2, ZNF354C and clinical predictors",
+               "Predictors: MCEMP1, TRABD2A, CD4 and ZNF354C",
+               "Predictors: MCEMP1 ,NELL2, CD4 and ZNF354C",
+               "Predictors: MCEMP1, TRABD2A, CD4, ZNF354C and clinical predictors", 
+               "Predictors: MCEMP1 ,NELL2, CD4, ZNF354C and clinical predictors",
+               "Predictors:Blood Neutrophil")
+## All TBM
+AUC_All <- c(M0_All[,"index.corrected"]["Dxy"], 
+             M1_All[,"index.corrected"]["Dxy"], 
+             M2_All[,"index.corrected"]["Dxy"],
+             M3_All[,"index.corrected"]["Dxy"], 
+             M4_All[,"index.corrected"]["Dxy"],
+             M5_All[,"index.corrected"]["Dxy"], 
+             M6_All[,"index.corrected"]["Dxy"],
+             M7_All[,"index.corrected"]["Dxy"], 
+             M8_All[,"index.corrected"]["Dxy"],
+             M9_All[,"index.corrected"]["Dxy"])
+AUC_All = AUC_All/2 + 0.5
+
+AUC_All_CI = c(M0_All_CI,
+               M1_All_CI,
+               M2_All_CI,
+               M3_All_CI,
+               M4_All_CI,
+               M5_All_CI,
+               M6_All_CI,
+               M7_All_CI,
+               M8_All_CI,
+               M9_All_CI)
+
+Calib_All <- c(M0_All[,"index.corrected"]["Slope"], 
+               M1_All[,"index.corrected"]["Slope"], 
+               M2_All[,"index.corrected"]["Slope"],
+               M3_All[,"index.corrected"]["Slope"],
+               M4_All[,"index.corrected"]["Slope"],
+               M5_All[,"index.corrected"]["Slope"], 
+               M6_All[,"index.corrected"]["Slope"],
+               M7_All[,"index.corrected"]["Slope"], 
+               M8_All[,"index.corrected"]["Slope"],
+               M9_All[,"index.corrected"]["Slope"])
+
+Brier_All <- c(M0_All[,"index.corrected"]["B"], 
+               M1_All[,"index.corrected"]["B"], 
+               M2_All[,"index.corrected"]["B"],
+               M3_All[,"index.corrected"]["B"], 
+               M4_All[,"index.corrected"]["B"],
+               M5_All[,"index.corrected"]["B"], 
+               M6_All[,"index.corrected"]["B"],
+               M7_All[,"index.corrected"]["B"], 
+               M8_All[,"index.corrected"]["B"],
+               M9_All[,"index.corrected"]["B"])
+
+# TBM HIV negative
+
+AUC_HIVneg <- c(M0_HIVneg[,"index.corrected"]["Dxy"], 
+                M1_HIVneg[,"index.corrected"]["Dxy"],
+                M2_HIVneg[,"index.corrected"]["Dxy"],
+                M3_HIVneg[,"index.corrected"]["Dxy"],
+                M4_HIVneg[,"index.corrected"]["Dxy"],
+                M5_HIVneg[,"index.corrected"]["Dxy"],
+                M6_HIVneg[,"index.corrected"]["Dxy"],
+                M7_HIVneg[,"index.corrected"]["Dxy"],
+                M8_HIVneg[,"index.corrected"]["Dxy"],
+                M9_HIVneg[,"index.corrected"]["Dxy"])
+AUC_HIVneg = AUC_HIVneg/2 + 0.5
+
+
+
+AUC_HIVneg_CI = c(M0_HIVneg_CI,
+               M1_HIVneg_CI,
+               M2_HIVneg_CI,
+               M3_HIVneg_CI,
+               M4_HIVneg_CI,
+               M5_HIVneg_CI,
+               M6_HIVneg_CI,
+               M7_HIVneg_CI,
+               M8_HIVneg_CI,
+               M9_HIVneg_CI)
+
+
+Calib_HIVneg <- c(M0_HIVneg[,"index.corrected"]["Slope"], 
+                  M1_HIVneg[,"index.corrected"]["Slope"],
+                  M2_HIVneg[,"index.corrected"]["Slope"],
+                  M3_HIVneg[,"index.corrected"]["Slope"],
+                  M4_HIVneg[,"index.corrected"]["Slope"],
+                  M5_HIVneg[,"index.corrected"]["Slope"],
+                  M6_HIVneg[,"index.corrected"]["Slope"],
+                  M7_HIVneg[,"index.corrected"]["Slope"],
+                  M8_HIVneg[,"index.corrected"]["Slope"],
+                  M9_HIVneg[,"index.corrected"]["Slope"])
+
+Brier_HIVneg <- c(M0_HIVneg[,"index.corrected"]["B"],
+                  M1_HIVneg[,"index.corrected"]["B"], 
+                  M2_HIVneg[,"index.corrected"]["B"],
+                  M3_HIVneg[,"index.corrected"]["B"], 
+                  M4_HIVneg[,"index.corrected"]["B"],
+                  M5_HIVneg[,"index.corrected"]["B"], 
+                  M6_HIVneg[,"index.corrected"]["B"],
+                  M7_HIVneg[,"index.corrected"]["B"], 
+                  M8_HIVneg[,"index.corrected"]["B"],
+                  M9_HIVneg[,"index.corrected"]["B"])
+
+# TBM HIV positive
+AUC_HIVpos <- c(M0_HIVpos[,"index.corrected"]["Dxy"], 
+                M1_HIVpos[,"index.corrected"]["Dxy"],
+                M2_HIVpos[,"index.corrected"]["Dxy"],
+                M3_HIVpos[,"index.corrected"]["Dxy"],
+                M4_HIVpos[,"index.corrected"]["Dxy"],
+                M5_HIVpos[,"index.corrected"]["Dxy"],
+                M6_HIVpos[,"index.corrected"]["Dxy"],
+                M7_HIVpos[,"index.corrected"]["Dxy"],
+                M8_HIVpos[,"index.corrected"]["Dxy"],
+                M9_HIVpos[,"index.corrected"]["Dxy"])
+AUC_HIVpos = AUC_HIVpos/2 + 0.5
+
+AUC_HIVpos_CI = c(M0_HIVpos_CI,
+               M1_HIVpos_CI,
+               M2_HIVpos_CI,
+               M3_HIVpos_CI,
+               M4_HIVpos_CI,
+               M5_HIVpos_CI,
+               M6_HIVpos_CI,
+               M7_HIVpos_CI,
+               M8_HIVpos_CI,
+               M9_HIVpos_CI)
+
+
+Calib_HIVpos <- c(M0_HIVpos[,"index.corrected"]["Slope"],
+                  M1_HIVpos[,"index.corrected"]["Slope"],
+                  M2_HIVpos[,"index.corrected"]["Slope"],
+                  M3_HIVpos[,"index.corrected"]["Slope"],
+                  M4_HIVpos[,"index.corrected"]["Slope"],
+                  M5_HIVpos[,"index.corrected"]["Slope"],
+                  M6_HIVpos[,"index.corrected"]["Slope"],
+                  M7_HIVpos[,"index.corrected"]["Slope"],
+                  M8_HIVpos[,"index.corrected"]["Slope"],
+                  M9_HIVpos[,"index.corrected"]["Slope"])
+
+Brier_HIVpos <- c(M0_HIVpos[,"index.corrected"]["B"],
+                  M1_HIVpos[,"index.corrected"]["B"], 
+                  M2_HIVpos[,"index.corrected"]["B"],
+                  M3_HIVpos[,"index.corrected"]["B"], 
+                  M4_HIVpos[,"index.corrected"]["B"],
+                  M5_HIVpos[,"index.corrected"]["B"], 
+                  M6_HIVpos[,"index.corrected"]["B"],
+                  M7_HIVpos[,"index.corrected"]["B"], 
+                  M8_HIVpos[,"index.corrected"]["B"],
+                  M9_HIVpos[,"index.corrected"]["B"])
+
+
+summary_AUC <- data.frame(Predictor_set = model_col,
+                          AUC_All = round(AUC_All,2), 
+                          AUC_All_CI = AUC_All_CI, 
+                          Brier_All = round(Brier_All,2),
+                          AUC_HIVneg = round(AUC_HIVneg,2),
+                          AUC_HIVneg_CI = AUC_HIVneg_CI,
+                          Brier_HIVneg = round(Brier_HIVneg,2),
+                          AUC_HIVpos = round(AUC_HIVpos,2), 
+                          AUC_HIVpos_CI = AUC_HIVpos_CI, 
+                          Brier_HIVpos = round(Brier_HIVpos,2))
+
+write.csv(summary_AUC, paste0(output,"general_output/","summary_AUC_for_selected_genes_Final_9Arp24.csv"))
+
+```
+
+
+```{r eval=FALSE, include=FALSE}
+
+model_col <- c("Predictors: MCEMP1, TRABD2A, and PKD1",
+               "Predictors: MCEMP1 ,NELL2 and ZNF354C",
+               "Predictors: MCEMP1, TRABD2A, PKD1 and ZNF354C",
+               "Predictors: MCEMP1 ,NELL2, PKD1 and ZNF354C",
+               "Predictors: MCEMP1, TRABD2A, PKD1, ZNF354C and clinical predictors (CSF Lympho)", 
+               "Predictors: MCEMP1 ,NELL2, PKD1, ZNF354C and clinical predictors (CSF Lympho)",
+               "Predictors: MCEMP1, TRABD2A, PKD1, ZNF354C and clinical predictors (Blood Neutro)", 
+               "Predictors: MCEMP1 ,NELL2, PKD1, ZNF354C and clinical predictors (Blood Neutro)",
+               "Predictors: MCEMP1, TRABD2A, PKD1, ZNF354C and clinical predictors (Lympho + neutro)", 
+               "Predictors: MCEMP1 ,NELL2, PKD1, ZNF354C and clinical predictors (Lympho + neutro)")
+
+AUC_All <- c(AUC_M1_All, AUC_M2_All, AUC_M3_All, AUC_M4_All,
+             AUC_M5_All, AUC_M6_All, AUC_M7_All, AUC_M8_All, AUC_M9_All, AUC_M10_All)
+
+AUC_HIV_uninfected <- c(AUC_M1_HIVneg, AUC_M2_HIVneg, AUC_M3_HIVneg, AUC_M4_HIVneg,
+                        AUC_M5_HIVneg, AUC_M6_HIVneg, AUC_M7_HIVneg, AUC_M8_HIVneg, AUC_M9_HIVneg, AUC_M10_HIVneg)
+
+AUC_HIV_infected <- c(AUC_M1_HIVpos, AUC_M2_HIVpos, AUC_M3_HIVpos, AUC_M4_HIVpos,
+                      AUC_M5_HIVpos, AUC_M6_HIVpos, AUC_M7_HIVpos, AUC_M8_HIVpos, AUC_M9_HIVpos, AUC_M10_HIVpos)
+
+summary_AUC <- data.frame(Models=model_col,
+                          AUC_All=AUC_All,
+                          AUC_HIV_uninfected=AUC_HIV_uninfected,
+                          AUC_HIV_infected=AUC_HIV_infected)
+
+write.csv(summary_AUC, paste0(output,"general_output/","summary_AUC_for_selected_genes.csv"))
+
+```
+
+
+## Plot AUC and calibration plot for HIV negative
+```{r}
+## AUC HIV negative
+data= df_HIVneg
+df_HIVneg
+## Model 1
+formula1 = evdeath_3M ~ AGE  + TBMGRADE + Log_CSF_Lymp 
+fit1 <- glm(formula1, data = data, family=binomial(link="logit"))
+# summary(fit1)
+
+## Model 2
+formula2 = evdeath_3M ~ MCEMP1 + NELL2  +  CD4 + ZNF354C + AGE + TBMGRADE
+fit2 <- glm(formula2, data = data, family=binomial(link="logit"))
+# summary(fit2)
+
+score.org1 <- Score(list("Model: Thao's et al." = fit1, "Model: our study" = fit2), formula=evdeath_3M~1,
+                   data=data, metrics=c("AUC","Brier"), summary="ipa", plot=c("ROC","calibration"))
+
+# score.org2 <- Score(list("Model: Gene set" = fit1, "Model: Gene set & clinical predictors" = fit2), formula=evdeath_3M~1,
+#                    data=data, metrics=c("AUC","Brier"), summary="ipa", plot=c("calibration"),
+#                     split.method="loob", B=100)
+
+# replace corrected AUC
+score.org1$AUC$score$AUC <- c(0.77,0.80)
+# score.org1$AUC$score$lower <- c(as.numeric(substr(AUC_M3_HIVneg,7,10)),as.numeric(substr(AUC_M9_HIVneg,6,9)))
+# score.org1$AUC$score$upper <- c(as.numeric(substr(AUC_M3_HIVneg,12,15)),as.numeric(substr(AUC_M9_HIVneg,11,14)))
+# plot AUC
+jpeg(file =  paste0(output,"/AUC/","Optimal_Geneset_AUC_HIVnegative_submit.jpeg"), wi = 7,
+     he = 7, units = "in",res=480)
+plotROC(score.org1, col=c("#3182bd","#de2d26","#252525"))
+dev.off()
+
+# plot cabliration
+jpeg(file =  paste0(output,"/AUC/","Optimal_Geneset_Calibration_HIVnegative_submit.jpeg"), wi = 7,
+     he = 7, units = "in",res=480)
+plotCalibration(score.org1, auc.in.legend = F,col=c("#3182bd","#de2d26","#252525"), method = "quantile")
+dev.off()
+```
+
+
+## Plot AUC and calibration plot for HIV positive
+```{r}
+## AUC HIV positive
+data= df_HIVpos
+formula1 = evdeath_3M ~ AGE  + TBMGRADE + Log_CSF_Lymp 
+fit1 <- glm(formula1, data = data, family=binomial(link="logit"))
+# summary(fit1)
+
+## Model 2
+formula2 = evdeath_3M ~ MCEMP1 + NELL2  +  CD4 + ZNF354C + AGE + TBMGRADE
+fit2 <- glm(formula2, data = data, family=binomial(link="logit"))
+# summary(fit2)
+
+score.org1 <- Score(list("Model: Thao's et al." = fit1, "Model: our study" = fit2), formula=evdeath_3M~1,
+                   data=data, metrics=c("AUC","Brier"), summary="ipa", plot=c("ROC","calibration"))
+
+# score.org2 <- Score(list("Model: Gene set" = fit1, "Model: Gene set & clinical predictors" = fit2), formula=evdeath_3M~1,
+#                    data=data, metrics=c("AUC","Brier"), summary="ipa", plot=c("calibration"),
+#                     split.method="loob", B=100)
+
+# replace corrected AUC
+score.org1$AUC$score$AUC <- c(0.82,0.86)
+
+# ## replace corrected AUC
+# score.org1$AUC$score$AUC <- c(as.numeric(substr(AUC_M3_HIVpos,1,4)),as.numeric(substr(AUC_M9_HIVpos,1,4)))
+# score.org1$AUC$score$lower <- c(as.numeric(substr(AUC_M3_HIVpos,7,10)),as.numeric(substr(AUC_M9_HIVpos,6,9)))
+# score.org1$AUC$score$upper <- c(as.numeric(substr(AUC_M3_HIVpos,12,15)),as.numeric(substr(AUC_M9_HIVpos,11,14)))
+
+#plot AUC
+jpeg(file =  paste0(output,"/AUC/","Optimal_Geneset_AUC_HIVpositive_submit.jpeg"), wi = 7,
+     he = 7, units = "in",res=480)
+plotROC(score.org1, col=c("#3182bd","#de2d26","#252525"), ci = F)
+dev.off()
+
+# # plot cabliration
+jpeg(file =  paste0(output,"/AUC/","Optimal_Geneset_Calibration_HIVpositive_submit.jpeg"), wi = 7,
+     he = 7, units = "in",res=480)
+plotCalibration(score.org1, auc.in.legend = F,col=c("#3182bd","#de2d26","#252525"), method = "nne")
+dev.off()
+```
+
+
+## testing other models
+
+```{r}
+## create formula
+formula = evdeath_3M ~ MCEMP1 + TBMGRADE + Log_CSF_Lymp + Log_BL_Neu
+formula = evdeath_3M ~  MCEMP1 + TBMGRADE
+# Fit model model  All TBM
+AUC_test_All <- AUC_summary(formula,data=df_All)
+Calib_test_All <- calibration_glm(formula,data=df_All,return_slope = F)
+
+# Fit model model  HIVneg
+AUC_test_HIVneg <- AUC_summary(formula,data=df_HIVneg)
+Calib_test_HIVneg <- calibration_glm(formula,data=df_HIVneg,return_slope = F)
+
+# Fit model model  HIV positive
+AUC_test_HIVpos <- AUC_summary(formula,data=df_HIVpos)
+Calib_test_HIVpos <- calibration_glm(formula,data=df_HIVpos, return_slope = F)
+```
+
+```{r}
+## create formula 
+formula = evdeath_3M ~  NELL2 + Log_BL_Neu + Log_CSF_Lymp + TBMGRADE +  AGE 
+formula = evdeath_3M ~ MCEMP1 + TRABD2A + PKD1 
+formula = evdeath_3M ~  MCEMP1 + TRABD2A + PKD1 + TBMGRADE + AGE
+
+
+ZNF354C
+FLOT1
+IL1R2
+MCEMP1
+Log_CSF_Lymp
+AGE
+NELL2
+Log_BL_Neu
+TBMGRADE
+
+
+
+# Fit model model 1 All TBM
+model<- lrm(formula, data = df_All, x = TRUE, y = TRUE )
+test_All <- validate(model,  B = 1000)
+test_All
+
+# Fit model model 1 HIVneg
+model<- lrm(formula, data = df_HIVneg, x = TRUE, y = TRUE )
+test_HIVneg <- validate(model,  B = 1000)
+test_HIVneg
+
+# Fit model model 1 HIV positive
+dim(df_HIVneg)
+model<- lrm(formula, data = df_HIVpos, x = TRUE, y = TRUE )
+pred <- predict(model, df_HIVpos, type = "fitted")
+val.prob(pred, df_HIVpos$evdeath_3M, g=10, cex=1.25)
+
+
+test_HIVpos <- validate(model,  B = 1000)
+test_HIVpos
+```
+
+
+
+
+
+
+```{r}
+#install.packages("riskRegression")
+library("riskRegression")
+library(rms)
+set.seed(12345)
+data = df_HIVpos
+dd <- datadist(data)
+dim(data)
+options ( datadist = "dd")
+formula = evdeath_3M ~ MCEMP1 + NELL2 + ZNF354C + PKD1 + AGE + TBMGRADE + Log_CSF_Lymp + Log_BL_Neu
+model<- lrm(formula , data = data, x = TRUE, y = TRUE )
+pred <- predict(model, data, type = "fitted")
+val.prob(pred, data$evdeath_3M, g=10, cex=1.25)
+
+set.seed(12345)
+bootcv_check <- validate(model,  B = 1000)
+bootcv_check
+```
+
+
+
+
+
+# 9 Boxplot for hub gene vs severity
+## subset data
+```{r}
+# colnames(df_TBM)[which(duplicated(colnames(df_TBM)))]
+df_TBM <- rbind(cbind(cox_HIVpos,data_HIVpos), cbind(cox_HIVneg,data_HIVneg)) %>%
+  mutate(BRMC_severity_grade=factor(TBMGRADE),
+         status = factor(evdeath_3M, levels = c(0,1),labels = c("No", "Yes")),
+         status2 = factor(status,levels =  c("No", "Yes"), labels =  c("TBM-S", "TBM-D")),
+         status3 = ifelse(status=="No"& Study=="27TB", "HIVneg-S",
+                          ifelse(status=="Yes"& Study=="27TB", "HIVneg-D",
+                                 ifelse(status=="No"& Study=="26TB", "HIVpos-S","HIVpos-D"))),
+         status3=factor(status3, levels = c("HIVneg-S","HIVneg-D","HIVpos-S","HIVpos-D")))
+names(df_TBM)
+table(df_TBM$status3)
+
+
+df_TBM_list <- list(TBMAll=df_TBM, TBMHIVpneg=subset(df_TBM,Study=="27TB"),TBMHIVpos=subset(df_TBM,Study=="26TB"))
+sub_ouput <- c("TBMAll","TBMHIVneg","TBMHIVpos")
+gene_plot <- unique(c(Hubgen_freq_HIVneg_export$gene,Hubgen_freq_HIVpos_export$gene))
+
+```
+
+```{r eval=FALSE, include=FALSE}
+## Boxplot for hub gene vs severity
+for (set in 1:3) {
+  for (gene in gene_plot) {
+    p <- Boxplot_for_genes(d = df_TBM_list[[set]],x="BRMC_severity_grade", 
+                           y=gene, xlab="BMRC serverity grade",
+                           ylab = "Log2 Normalized count", title = gene)
+  jpeg(file =  paste0(output,"/boxplot/RNAseq_D0/TBMgrade/",sub_ouput[set],"/",
+                      gene,"_boxplot.jpeg"), wi = 6, he = 6, units = "in",res=480)
+  print(p)
+  dev.off()
+  print(paste0(gene, " in set ", sub_ouput[set]))
+  }
+}
+
+## Box plot hub genes vs mortality in TBM
+for (set in 1:3) {
+  for (gene in gene_plot) {
+    p <- Boxplot_for_genes(d = df_TBM_list[[set]],x="status", 
+                                                             y=gene, xlab="Group",
+                                                             ylab = "Log2 Normalized count", title = gene)
+  jpeg(file =  paste0(output,"/boxplot/RNAseq_D0/Mortality/",sub_ouput[set],"/",gene,"_boxplot.jpeg"), wi = 7, 
+       he = 7, units = "in",res=480)
+  print(p)
+  dev.off()
+  print(paste0(gene, "in set ", sub_ouput[set]))
+  }
+}
+
+## Box plot hub genes vs mortality in TBM with 4 status
+for (gene in gene_plot) {
+    p <- Boxplot_for_genes(d = df_TBM,x="status3",
+                           y=gene, xlab="3-Month Mortality",
+                           ylab = "Log2 Normalized count", title = gene)
+  jpeg(file =  paste0(output,"/boxplot/RNAseq_D0/Mortality/","TBMHIV","/",gene,"_boxplot.jpeg"), wi = 6, 
+       he = 6, units = "in",res=480)
+  print(p)
+  dev.off()
+  print(gene)
+}
+
+##Box plot for genes in 3 specific pathways
+gene_plot <-read_excel_allsheets(paste0(output,"general_output/File 9 - Consensus modules gene list and functional enrichment for specific modules.xlsx"))
+gene_plot <- unique(gene_plot$Gene_list_3_specific_pathways$Genes)
+
+df_TBM %<>% mutate(status3=factor(status3, levels = c("HIVneg-S","HIVneg-D","HIVpos-S","HIVpos-D")))
+
+
+for (gene in gene_plot) {
+    p <- Boxplot_for_genes(d = df_TBM,x="status3",
+                           y=gene, xlab="3-Month Mortality",
+                           ylab = "Log2 Normalized count", title = gene)
+  jpeg(file =  paste0(output,"/boxplot/RNAseq_D0/Mortality/","TBMspecific","/",gene,"_boxplot.jpeg"), wi = 6, 
+       he = 6, units = "in",res=480)
+  print(p)
+  dev.off()
+  print(gene)
+}
+
+##Box plot hub genes vs mortality in TBM and other data
+gene_plot <- unique(c(Hubgen_freq_HIVneg_export$gene,Hubgen_freq_HIVpos_export$gene))
+Expr_All <- get(load(file="../General_analysis/RData/gene_clini_adjusted_ComBat_all.Rdata"))
+rownames(Expr_All) <- Expr_All$LIMS_ID
+df_other <- Expr_All %>% subset(Study %in% c("28TB", "29TB", "43TB")) %>% 
+  mutate(status = factor(Study, levels = c("43TB", "28TB", "29TB"), labels = c("Healthy","PTB", "PTB")),
+         status2 = factor(Study, levels = c("43TB", "28TB", "29TB"), labels = c("Healthy","PTB", "PTB"))) %>%
+  dplyr::select(all_of(gene_plot),"status","status2", "Study")
+df_TBM_S <- df_TBM %>% dplyr::select(all_of(gene_plot),"status","status2","Study")
+df <- rbind(df_other, df_TBM_S)
+
+names(df)
+
+for (gene in gene_plot) {
+    p <- Boxplot_for_genes(d = df,x="status2",
+                           y=gene, xlab="Group",
+                           ylab = "Log2 Normalized count", title = gene)
+  jpeg(file =  paste0(output,"/boxplot/RNAseq_D0/Mortality/","TBMandOthers","/",gene,"_boxplot.jpeg"), wi = 6, 
+       he = 6, units = "in",res=480)
+  print(p)
+  dev.off()
+  print(gene)
+}
+
+```
+
+## box plot for Selected in in prediction models
+```{r}
+library(gtsummary)
+gene_plot <- unique(c(Hubgen_freq_HIVneg_export$gene,Hubgen_freq_HIVpos_export$gene))
+
+Expr_All <- get(load(file="../General_analysis/RData/gene_clini_adjusted_ComBat_all.Rdata"))
+rownames(Expr_All) <- Expr_All$LIMS_ID
+df_other <- Expr_All %>% subset(Study %in% c("28TB", "29TB", "43TB")) %>% 
+  mutate(status = factor(Study, levels = c("43TB", "28TB", "29TB"), labels = c("Healthy","PTB", "PTB")),
+         status2 = factor(Study, levels = c("43TB", "28TB", "29TB"), labels = c("Healthy","PTB", "PTB"))) %>%
+  dplyr::select(all_of(gene_plot),"status","status2", "Study")
+df_TBM_S <- df_TBM %>% dplyr::select(all_of(gene_plot),"status","status2","Study")
+df <- rbind(df_other, df_TBM_S)
+
+names(df)
+
+df %<>% mutate(group=factor(Study, levels = c("43TB","29TB","28TB", "27TB", "26TB"),
+                            labels = c("Heathly","PTB","PTB", "HIVneg-TBM", "HIVpos-TBM")),
+               Groups=factor(status,levels = c("Healthy","PTB","No","Yes"),
+                                labels = c("Healthy","PTB","TBM-S","TBM-D")))
+table(df$Groups)
+names(df)
+```
+
+
+```{r}
+# gene = "TRABD2A"
+for (gene in gene_plot) {
+  print(gene)
+  ## calculate wilcox 27TB
+  df_test1 <- df %>%
+  subset(Study=="27TB") %>%
+  dplyr::select(all_of(gene),status) %>%
+  mutate(status=factor(status))
+  colnames(df_test1)[1] <- "gene"
+  test <- df_test1 %>%
+    tbl_summary(by = status) %>%
+    add_p()
+  pval <- test$table_body$p.value
+  if(pval < 0.1){
+    sig1 = as.character(gtools::stars.pval(pval))
+    size_sig1 = 15
+    } else  {
+      sig1 <- "NS"
+      size_sig1 = 7}
+  df_test2 <- df %>%
+    subset(Study=="26TB") %>%
+    dplyr::select(all_of(gene),status) %>%
+    mutate(status=factor(status))
+  colnames(df_test2)[1] <- "gene"
+  test <- df_test2 %>%
+    tbl_summary(by = status) %>%
+    add_p()
+  pval <- test$table_body$p.value
+  if(pval < 0.1){
+    sig2 <- as.character(gtools::stars.pval(pval))
+    size_sig2 = 15
+    } else {
+      sig2 <- "NS"
+      size_sig2 = 7}
+  label.df1 <- data.frame(group = c("HIVneg-TBM"),
+                          gene = max(c(df_test1$gene,df_test2$gene))+ 0.2)
+  label.df2 <- data.frame(group = c("HIVpos-TBM"),
+                          gene = max(c(df_test1$gene,df_test2$gene))+ 0.2)
+  # data to plot 
+  df_plot <- df %>%
+    dplyr::select(all_of(gene),group,Groups)
+  colnames(df_plot)[1] <- "gene"
+  P <- ggplot(df_plot, aes(x = group, y = gene)) +
+    geom_boxplot(size=1,position=position_dodge(1),width=0.7,
+                 fill="white",outlier.colour="red",
+                 outlier.shape=NA,outlier.size=3)+
+    geom_jitter(aes(color=Groups,fill=Groups),width=0.2,size=2,alpha = 0.5)+
+    scale_color_manual(values=c("#252525","#00441b","#3182bd","#de2d26"))+
+    theme_bw()+
+    labs(x="",y = "Log2 normalized count", title = gene)+#,subtitle = ""
+    theme(plot.title = element_text(size = 25),
+        legend.text = element_text(size = 20) ,
+        #legend.position="bottom",
+        legend.title = element_text(size = 20,color="black",face="bold"),
+        axis.text = element_text(size = 25),
+        axis.text.x=element_text(color="black",size=13,face="bold"),
+        axis.title.x = element_text(size = 20,color="black",face="bold"),
+        axis.text.y=element_text(color="black",size=20),
+        axis.title.y = element_text(size = 20,color="black",face="bold"),
+        axis.title= element_text(size = 40,color="black",face="bold"))+
+    scale_x_discrete("",labels = c("Healthy" = "Healthy \n Controls",
+                                 "PTB" = "PTB",
+                                 "HIVneg-TBM"="HIVneg\nTBM",
+                                 "HIVpos-TBM"="HIVpos\nTBM")) +
+    geom_text(data = label.df1, label = sig1, size=size_sig1) +
+    geom_text(data = label.df2, label = sig2, size=size_sig2)
+  jpeg(file =  paste0(output,"/boxplot_new/RNAseq_D0/Mortality/",gene,"_boxplot.jpeg"), wi = 7, 
+       he = 6, units = "in",res=480)
+print(P)
+dev.off()
+}
+
+
+```
+
+## box plot for hub genes in specific module in HIV-uninfected and HIV-infected TBM
+```{r}
+gene_plot <-read_excel_allsheets(paste0(output,"general_output/File 9 - Consensus modules gene list and functional enrichment for specific modules.xlsx"))
+gene_plot <- unique(gene_plot$Gene_list_3_specific_pathways$Genes)
+
+gene = gene_plot[1]
+for (gene in gene_plot) {
+  print(gene)
+  ## calculate wilcox 27TB
+  df_test1 <- df_TBM %>%
+  subset(Study=="27TB") %>%
+  dplyr::select(all_of(gene),status) %>%
+  mutate(status=factor(status))
+  colnames(df_test1)[1] <- "gene"
+  test <- df_test1 %>%
+    tbl_summary(by = status) %>%
+    add_p()
+  pval <- test$table_body$p.value
+  if(pval < 0.1){
+    sig1 = as.character(gtools::stars.pval(pval))
+    size_sig1 = 15
+    } else  {
+      sig1 <- "NS"
+      size_sig1 = 7}
+  df_test2 <- df_TBM %>%
+    subset(Study=="26TB") %>%
+    dplyr::select(all_of(gene),status) %>%
+    mutate(status=factor(status))
+  colnames(df_test2)[1] <- "gene"
+  test <- df_test2 %>%
+    tbl_summary(by = status) %>%
+    add_p()
+  pval <- test$table_body$p.value
+  if(pval < 0.1){
+    sig2 <- as.character(gtools::stars.pval(pval))
+    size_sig2 = 15
+    } else {
+      sig2 <- "NS"
+      size_sig2 = 7}
+  label.df1 <- data.frame(group = c("HIVneg-TBM"),
+                          gene = max(c(df_test1$gene,df_test2$gene))+ 0.2)
+  label.df2 <- data.frame(group = c("HIVpos-TBM"),
+                          gene = max(c(df_test1$gene,df_test2$gene))+ 0.2)
+  # data to plot 
+  df_plot <- df %>%
+    dplyr::select(all_of(gene),group,Groups)
+  colnames(df_plot)[1] <- "gene"
+  P <- ggplot(df_plot, aes(x = group, y = gene)) +
+    geom_boxplot(size=1,position=position_dodge(1),width=0.7,
+                 fill="white",outlier.colour="red",
+                 outlier.shape=NA,outlier.size=3)+
+    geom_jitter(aes(color=Groups,fill=Groups),width=0.2,size=2,alpha = 0.5)+
+    scale_color_manual(values=c("#252525","#00441b","#3182bd","#de2d26"))+
+    theme_bw()+
+    labs(x="",y = "Log2 normalized count", title = gene)+#,subtitle = ""
+    theme(plot.title = element_text(size = 25),
+        legend.text = element_text(size = 20) ,
+        #legend.position="bottom",
+        legend.title = element_text(size = 20,color="black",face="bold"),
+        axis.text = element_text(size = 25),
+        axis.text.x=element_text(color="black",size=13,face="bold"),
+        axis.title.x = element_text(size = 20,color="black",face="bold"),
+        axis.text.y=element_text(color="black",size=20),
+        axis.title.y = element_text(size = 20,color="black",face="bold"),
+        axis.title= element_text(size = 40,color="black",face="bold"))+
+    scale_x_discrete("",labels = c("Healthy" = "Healthy \n Controls",
+                                 "PTB" = "PTB",
+                                 "HIVneg-TBM"="HIVneg\nTBM",
+                                 "HIVpos-TBM"="HIVpos\nTBM")) +
+    geom_text(data = label.df1, label = sig1, size=size_sig1) +
+    geom_text(data = label.df2, label = sig2, size=size_sig2)
+  jpeg(file =  paste0(output,"/boxplot_new/RNAseq_D0/Mortality_specific/",gene,"_boxplot.jpeg"), wi = 7, 
+       he = 6, units = "in",res=480)
+print(P)
+dev.off()
+}
+
+
+```
+
+
+
+# 10 rms AUC table for genes in HIV negative and HIV positive (don't use)
+
+```{r}
+library(rms)
+set.seed(1235)
+AUC_rms <- function(df,formula,B=1000,seed=12345,round.digit=3) {
+  set.seed(seed)
+  dd <- datadist(data_HIVneg)
+options(datadist = "dd")
+model<- lrm(formula, data = df, x = TRUE, y = TRUE )
+val<-validate(model , B = B)
+AUC <-val["Dxy","index.corrected"]/2+0.5
+return(round(AUC,round.digit))
+}
+
+#data set for HIVneg
+data_HIVneg = cbind(cox_HIVneg,data_HIVneg) %>%
+  dplyr::select( "MCEMP1","TRABD2A","CD28", "FCAR","ZNF354C","evdeath_3M",  "AGE", "TBMGRADE" , "CSFLYMTOT")
+data_HIVpos = cbind(cox_HIVpos,data_HIVpos) %>%
+  dplyr::select( "MCEMP1","TRABD2A","CD28", "FCAR","ZNF354C","evdeath_3M",  "AGE", "TBMGRADE" , "CSFLYMTOT")
+
+####################### model 1
+## create formula 1
+formula = evdeath_3M ~ MCEMP1 + TRABD2A + ZNF354C 
+
+# Fit model model 1 HIVneg
+AUC_model1_HIVneg <- AUC_rms(df=data_HIVneg,formula)
+
+# Fit model model 1 HIV positive
+AUC_model1_HIVpos <- AUC_rms(df=data_HIVpos,formula)
+
+####################### model 2
+## create formula 2
+formula = evdeath_3M ~ MCEMP1 + TRABD2A +  AGE + TBMGRADE + CSFLYMTOT
+
+# Fit model model 2 HIVneg
+AUC_model2_HIVneg <- AUC_rms(df=data_HIVneg,formula)
+
+# Fit model model 2 HIV positive
+AUC_model2_HIVpos <- AUC_rms(df=data_HIVpos,formula)
+
+####################### model 3
+## create formula 3
+formula = evdeath_3M ~ CD28 + FCAR + ZNF354C 
+
+# Fit model model 3 HIVneg
+AUC_model3_HIVneg <- AUC_rms(df=data_HIVneg,formula)
+
+# Fit model model 3 HIV positive
+AUC_model3_HIVpos <- AUC_rms(df=data_HIVpos,formula)
+
+
+####################### model 4
+## create formula 4
+formula = evdeath_3M ~ CD28 + FCAR + ZNF354C + AGE + TBMGRADE + CSFLYMTOT
+
+# Fit model model 4 HIVneg
+AUC_model4_HIVneg <- AUC_rms(df=data_HIVneg,formula)
+
+# Fit model model 4 HIV positive
+AUC_model4_HIVpos <- AUC_rms(df=data_HIVpos,formula)
+
+####################### model 5
+## create formula 5
+formula = evdeath_3M ~ MCEMP1 + TRABD2A 
+
+# Fit model model 5 HIVneg
+AUC_model5_HIVneg <- AUC_rms(df=data_HIVneg,formula)
+
+# Fit model model 5 HIV positive
+AUC_model5_HIVpos <- AUC_rms(df=data_HIVpos,formula)
+
+
+model_col <- c("Predictors: MCEMP1 and TRABD2A", 
+               "Predictors: MCEMP1, TRABD2A and ZNF354C",
+               "Predictors: MCEMP1, TRABD2A, ZNF354C and clinical predictors", 
+               "Predictors: CD28, FCAR and ZNF354C", 
+               "Predictors: CD28, FCAR, ZNF354C and clinical predictors")
+AUC_HIV_uninfected <- c(AUC_model5_HIVneg,
+                        AUC_model1_HIVneg,
+                        AUC_model2_HIVneg,
+                        AUC_model3_HIVneg,
+                        AUC_model4_HIVneg)
+AUC_HIV_infected <- c(AUC_model5_HIVpos,
+                      AUC_model1_HIVpos,
+                      AUC_model2_HIVpos,
+                      AUC_model3_HIVpos,
+                      AUC_model4_HIVpos)
+summary_AUC <- data.frame(Models=model_col,
+                         AUC_HIV_uninfected=AUC_HIV_uninfected,
+                         AUC_HIV_infected=AUC_HIV_infected)
+
+write.csv(summary_AUC, paste0(output,"general_output/","summary_AUC_for_selected_genes.csv"))
+
+```
+
+
+# 11. Cor plot for hub gene vs clinical data
+
+```{r}
+#=====================================================================================
+#  Code chunk 14
+#=====================================================================================
+library(ggcorrplot)
+Expr_All <- rbind(cbind(cox_HIVpos,data_HIVpos), cbind(cox_HIVneg,data_HIVneg)) %>%
+  mutate(TBMGRADE = as.numeric(TBMGRADE),
+         white_blood_cell=WBC,
+         Bl_neutrophils_pt=NEUTLE,
+         Bl_lymphocytes_pt = LYMLE,
+         Bl_CD4 = CD4_cells,
+         CSF_white_cell = CSFWBC,
+         CSF_lymphocytes_pt=CSFLYMLE,
+         CSF_Protein =PROTEIN,
+         CSF_Lactate= LACTATE,
+         CSF_Glucose = CSFGLUC)
+
+selected_genes <- c(hub_genes$gene,specific_HIVneg$gene,specific_HIVpos$gene)
+table(Expr_All$Study)
+
+jpeg(file =  paste0(output,"/general_output/figures/GenesvsClinical_heatmap_HIVpos.jpeg"), wi = 10, 
+     he = 4, units = "in",res=480)
+corrGeneClin(df = subset(Expr_All,Study=="26TB"), h_vars= selected_genes, 
+             v_vars = c("white_blood_cell","totalneutrobl","totallymphobl",
+                        "CSF_white_cell", "totalcsflympho"),
+             coef_lab = T,hc.order=F)
+dev.off()
+
+
+jpeg(file =  paste0(output,"/general_output/figures/GenesvsClinical_heatmap_HIVneg.jpeg"), wi = 10, 
+     he = 4, units = "in",res=480)
+corrGeneClin(df = subset(Expr_All,Study=="27TB"), h_vars= selected_genes, 
+             v_vars = c("white_blood_cell","totalneutrobl","totallymphobl",
+                        "CSF_white_cell", "totalcsflympho"),
+             coef_lab = T,hc.order=F)
+dev.off()
+
+
+
+```
+
+# 12. Plot Module network
+## HR in All TBM for all genes in wgcna
+
+```{r}
+library(RCy3)
+library(ggrepel)
+library(igraph)
+common_hub <- read.csv(paste0(output,"general_output/Common_Hubgenes_raw.csv"))
+## HR for genes in All TBM
+TBM_Exp <- rbind(multiExpr[[1]]$data,
+                 multiExpr[[2]]$data)
+TBM_Traits <- rbind(Traits[[1]]$data,
+                    Traits[[2]]$data)
+pheno_name="evdeath_3M"
+pheno_index = c(which(names(TBM_Traits) %in% c("ttdeath","evdeath")),
+                which(names(TBM_Traits) %in% c("AGE", "Treatment","Study")))
+
+TBM_Cox <- get_GSCox_WGCNA(Expr = TBM_Exp,pheno =TBM_Traits,pheno_index = pheno_index,evdays=97,covar = 3)
+
+TNF_signaling <-  get_genelist_pathway_kegg(hsa_ID = "hsa04668")
+
+
+#TBM_Cox <- get_GSCox_level(Expr = TBM_Exp,pheno=TBM_Traits,pheno_index = pheno_index,evdays=97,covar = NULL) 
+TBM_Cox %<>%
+  mutate(Log_HR = log(GeneEffect))
+rownames(TBM_Cox) <- TBM_Cox$Gene
+
+head(TBM_Cox)
+
+
+#load TOM matrix
+# tomnames <- load(paste0(output,"TBM_Death_discovery-TOM_5000-block.1.RData"))
+# TOM <- as.matrix(TOM) # convert dist class object to matrix
+adjacency = adjacency(rbind(multiExpr[[1]]$data,multiExpr[[2]]$data),
+                      power = 8,type ="unsigned")
+TOM = TOMsimilarity(adjacency)
+
+colnames(TOM) <- colnames(adjacency)
+rownames(TOM) <- rownames(adjacency)
+
+module_targets <- c("blue", "brown", "red", "cyan", "black")
+node_cutoff <- c(50,50,50,50, 50)
+
+```
+
+## Blue
+
+```{r}
+module="blue"
+hub_coexp_genes <- common_hub %>% filter(module=="blue")
+hub_coexp_genes<- hub_coexp_genes$gene
+n=50
+target_modulue <- GSMM$blue[[1]] %>% dplyr::arrange(totalRank) 
+gene_list = target_modulue$gene[1:n]
+gene_list_HR <- TBM_Cox[gene_list,] %>% 
+  mutate(Log_HR= ifelse(GeneSignificance > 0.05, 0,Log_HR)) %>%
+  dplyr::select(Log_HR)
+drawn_network_WGCNA(TOM = TOM, gene_list = gene_list,node_cutoff = n,
+                      module_color = module, gradient_color=gene_list_HR$Log_HR,
+                      coexp_genes = hub_coexp_genes,
+                      title = paste0(module," network"),
+                      collection = "for Mortality in HIVneg")
+```
+
+## Brown
+
+```{r}
+module="brown"
+hub_coexp_genes <- common_hub %>% filter(module=="brown")
+hub_coexp_genes<- hub_coexp_genes$gene
+n=50
+target_modulue <- GSMM$brown[[1]] %>% dplyr::arrange(totalRank) 
+gene_list = target_modulue$gene[1:n]
+gene_list_HR <- TBM_Cox[gene_list,] %>% 
+  mutate(Log_HR= ifelse(GeneSignificance > 0.05, 0,Log_HR)) %>%
+  dplyr::select(Log_HR)
+drawn_network_WGCNA(TOM = TOM, gene_list = gene_list,node_cutoff = n,
+                      module_color = module, gradient_color=gene_list_HR$Log_HR,
+                      coexp_genes = hub_coexp_genes,
+                      title = paste0(module," network"),
+                      collection = "for Mortality in HIVneg")
+```
+
+## Red
+
+```{r}
+module="red"
+hub_coexp_genes <- common_hub %>% filter(module=="red")
+hub_coexp_genes<- hub_coexp_genes$gene
+n=50
+target_modulue <- GSMM$red[[1]] %>% dplyr::arrange(totalRank) 
+gene_list = target_modulue$gene[1:n]
+gene_list_HR <- TBM_Cox[gene_list,] %>% 
+  mutate(Log_HR= ifelse(GeneSignificance > 0.05, 0,Log_HR)) %>%
+  dplyr::select(Log_HR)
+drawn_network_WGCNA(TOM = TOM, gene_list = gene_list,node_cutoff = n,
+                      module_color = module, gradient_color=gene_list_HR$Log_HR,
+                      coexp_genes = hub_coexp_genes,
+                      title = paste0(module," network"),
+                      collection = "for Mortality in HIVneg")
+```
+
+
+
+
+## Black
+
+```{r}
+module="black"
+hub_coexp_genes <- common_hub %>% filter(module=="black")
+hub_coexp_genes<- hub_coexp_genes$gene
+n=50
+target_modulue <- GSMM$black[[1]] %>% dplyr::arrange(totalRank) 
+gene_list = target_modulue$gene[1:n]
+gene_list_HR <- TBM_Cox[gene_list,] %>% 
+  mutate(Log_HR= ifelse(GeneSignificance > 0.05, 0,Log_HR)) %>%
+  dplyr::select(Log_HR)
+drawn_network_WGCNA(TOM = TOM, gene_list = gene_list,node_cutoff = n,
+                      module_color = module, gradient_color=gene_list_HR$Log_HR,
+                      coexp_genes = hub_coexp_genes,
+                      title = paste0(module," network"),
+                      collection = "for Mortality in HIVneg")
+```
+
+
+## Cyan
+
+```{r}
+n=44
+module="cyan"
+cyan_modulue <- GSMM$cyan[[1]] %>% dplyr::arrange(totalRank) 
+gene_list = cyan_modulue$gene[1:n]
+gene_list_HR <- TBM_Cox[gene_list,] %>% 
+  mutate(Log_HR= ifelse(GeneSignificance > 0.05, 0,Log_HR)) %>%
+  dplyr::select(Log_HR)
+drawn_network_WGCNA(TOM = TOM, gene_list = gene_list,node_cutoff = n,
+                      module_color = module, gradient_color=gene_list_HR$Log_HR,
+                      title = paste0(module," network"),
+                      collection = "for Mortality in discovery")
+```
+
+
+
+
+## For all modules
+```{r}
+module="blue"
+for (module in module_targets){
+  index <- which(module_targets==module)
+  #print(module)
+  gene_list <- names(moduleLabels_dis[moduleColors_dis == module])
+  #print(gene_list)
+  drawn_network_WGCNA(TOM = TOM, gene_list = gene_list,node_cutoff = node_cutoff[index],
+                      module_color = module, gradient_color=gene_list_HR$Log_HR,
+                      title = paste0(module," network"),
+                      collection = "for Mortality in discovery")
+}
+## then save sestion to ses file. download and open in local destop
+# network_blue <- network
+# save(network_blue, file = paste0(output,"network_blue.RData"))
+
+library(RCy3)
+cytoscapePing()
+# createNetworkFromIgraph(network)
+
+```
+
+# 13. Plot consensus modules.
+## yellow in HIVneg
+
+```{r}
+library(RCy3)
+library(ggrepel)
+library(igraph)
+## load data and create TOM
+output2 <- "WGCNA/All_study/Consensus_TBM/General_DEX/"
+study = "TBM_Death_281"
+# Load the data saved in the first part
+lnames = load( paste0(output2,study,"-01-dataInput.RData"));
+# The variable lnames contains the names of loaded variables.
+lnames
+dim(multiExpr[[2]]$data)
+
+# sft1 = pickSoftThreshold(multiExpr[[1]]$data, powerVector = powers, verbose = 5)
+# sft2 = pickSoftThreshold(multiExpr[[2]]$data, powerVector = powers, verbose = 5)
+# power= min(sft1$powerEstimate,sft2$powerEstimate)
+
+adjacency = adjacency(multiExpr[[1]]$data,
+                      power = 8,type ="unsigned")
+TOM = TOMsimilarity(adjacency)
+
+colnames(TOM) <- colnames(adjacency)
+rownames(TOM) <- rownames(adjacency)
+
+# Load gene in consensus modules
+yellow_consensus <- read.csv(paste0(output2,"general_output/yellow_Conssensus_modules_MMandGS.csv")) %>%
+  dplyr::arrange(totalRank_HIVneg) 
+rownames(yellow_consensus) <- yellow_consensus$gene
+
+ 
+specific_hub_selected <- read.csv(paste0(output2,"general_output/Specific_consensus_hubgenes.csv"))
+
+
+
+# drawn net work
+module="yellow"
+coexp_genes = specific_hub_selected %>% filter(module=="yellow") 
+n=50
+gene_list = yellow_consensus$gene[1:n]
+gene_list_HR <- yellow_consensus[gene_list,] %>% 
+  mutate(Log_HR= ifelse(GS_HIVneg < 1.3, 0,log(HR_HIVneg))) %>%
+  dplyr::select(Log_HR)
+drawn_network_WGCNA(TOM = TOM, gene_list = gene_list,node_cutoff = n,
+                      module_color = module, gradient_color=gene_list_HR$Log_HR,
+                      coexp_genes = coexp_genes$gene, nodesize = 50, Hubsize = 75,
+                      title = paste0(module," network"),
+                      collection = "for Mortality in HIVneg")
+drawn_network_WGCNA(TOM = TOM, gene_list = gene_list,node_cutoff = node_cutoff[index],
+                      module_color = module, gradient_color=gene_list_HR$Log_HR,
+                      title = paste0(module," network"),
+                      collection = "for Mortality in discovery")
+```
+
+## Blue in HIVpos
+
+```{r}
+## create TOM HIVpos
+power= min(sft1$powerEstimate,sft2$powerEstimate)
+
+dim(multiExpr[[2]]$data)
+adjacency = adjacency(multiExpr[[2]]$data,
+                      power = 8,type ="unsigned")
+TOM = TOMsimilarity(adjacency)
+
+colnames(TOM) <- colnames(adjacency)
+rownames(TOM) <- rownames(adjacency)
+
+# Load gene in consensus modules
+blue_consensus <- read.csv(paste0(output2,"general_output/blue_Conssensus_modules_MMandGS.csv")) %>%
+  dplyr::arrange(totalRank_HIVpos) 
+rownames(blue_consensus) <- blue_consensus$gene
+
+# drawn net work
+module="blue"
+coexp_genes = specific_hub_selected %>% filter(module=="blue") 
+n=50
+gene_list = blue_consensus$gene[1:n]
+gene_list_HR <- blue_consensus[gene_list,] %>% 
+  mutate(Log_HR= ifelse(GS_HIVpos < 1.3, 0,log(HR_HIVpos))) %>%
+  dplyr::select(Log_HR)
+drawn_network_WGCNA(TOM = TOM, gene_list = gene_list,node_cutoff = n,
+                      module_color = module, gradient_color=gene_list_HR$Log_HR,
+                      coexp_genes = coexp_genes$gene, nodesize = 50, Hubsize = 75,
+                      title = paste0(module," network"),
+                      collection = "for Mortality in HIVpos")
+
+yellow_s <- yellow_consensus %>%
+  filter(GS_HIVneg > 1.3 ) %>%
+  filter(HR_HIVneg < 1 & HR_HIVpos > 1)
+# 
+blue_s <- blue_consensus %>%
+  filter( GS_HIVpos > 1.3) %>%
+  filter(HR_HIVneg < 1 & HR_HIVpos > 1)
+
+yellow_blue_Filter <- rbind(yellow_s, blue_s)
+
+write.csv(yellow_blue_Filter,paste0(output2,"general_output/yellow_blue_Filter_Conssensus_modules_MMandGS.csv"))
+```
+
+# 14A Visualize some KEGG
+```{r}
+TBM_Exp <- rbind(multiExpr[[1]]$data,
+                 multiExpr[[2]]$data)
+TBM_Traits <- rbind(Traits[[1]]$data,
+                    Traits[[2]]$data)
+pheno_name="evdeath_3M"
+
+
+dim(TBM_Exp)
+
+
+pheno_index = c(which(names(Traits[[1]]$data) %in% c("ttdeath","evdeath")),
+                which(names(Traits[[1]]$data) %in% c("AGE","Treatment", "Study")))
+
+TBM_Cox <- get_GSCox_WGCNA(Expr = TBM_Exp,TBM_Traits,pheno_index = pheno_index,evdays=97,covar = NULL)
+colnames(TBM_Cox)[1] <- c("gene")
+
+dim(TBM_Cox)
+
+All_gene_ID <- unlist(mget(TBM_Cox$gene, revmap(org.Hs.egSYMBOL),ifnotfound=NA)) 
+All_gene_ID <- data.frame(gene=names(All_gene_ID),ID= unname(All_gene_ID))
+
+## merge gene data vs ID
+df <- TBM_Cox %>% merge(.,All_gene_ID, by="gene",all.x=T) %>%
+  mutate(log_HR=log2(GeneEffect)) %>%
+  subset(!is.na(ID)) %>%
+  dplyr::select(ID, GeneSignificance, log_HR) 
+rownames(df) <- df$ID
+
+df_kegg <- df %>% 
+  filter(GeneSignificance < 0.05) %>%
+  dplyr::select(log_HR) %>% 
+  as.matrix
+## TLR
+setwd(paste0(output,"general_output/kegg_figures/"))
+pv.out <- pathview(gene.data = df_kegg, pathway.id = "hsa04620", 
+                   out.suffix ="hsa_TLR_signaling_All_TBM",
+                   kegg.native = T)
+#NFKB
+pv.out <- pathview(gene.data = df_kegg, pathway.id = "hsa04064", 
+                   out.suffix ="hsa_NFKB_signaling_All_TBM",
+                   kegg.native = T)
+
+## MAPK
+pv.out <- pathview(gene.data = df_kegg, pathway.id = "hsa04010", 
+                   out.suffix ="hsa_MAPK_signaling_All_TBM",
+                   kegg.native = T)
+
+## TNF signaling
+pv.out <- pathview(gene.data = df_kegg, pathway.id = "hsa04668", 
+                   out.suffix ="hsa_TNF_signaling_All_TBM",
+                   kegg.native = T)
+
+
+pv.out <- pathview(gene.data = df_kegg, pathway.id = "hsa04668", 
+                   out.suffix ="hsa_TNF_signaling_All_TBM",
+                   kegg.native = T)
+
+Reactome <- read.gmt("/home/ubuntu/tb_volume/Hai_Cpath_Analysis/Rstudio_sever/github_repos/Dexa_transcriptomics/Pathway_database/Reactome_2022.gmt")
+Reactome_name <- names(Reactome)
+rename_Reactome <- function(x){
+  as.character(strsplit(x,split=" R-HSA-",fixed=TRUE)[[1]][1])
+}
+names(Reactome) <- as.character(lapply(Reactome_name,rename_Reactome))
+Interferon_signaling <- Reactome[["Interferon Signaling"]]
+
+head(TBM_Cox)
+
+TBM_Cox %>% filter(gene %in% Interferon_signaling) %>% filter(GeneSignificance < 0.01) 
+
+```
+
+
+
+## 1. Design matrix an contrast matrix
+```{r}
+# names(TBM_sample_infor)
+design <- model.matrix(~0 +evdeath_3M +AGE + Treatment, data = TBM_sample_infor)
+colnames(design) <- gsub("group", "", colnames(design))
+```
+
+
+```{r}
+contr.matrix <- makeContrasts(
+  Mortality_AllTBM = (TBM_HIVnegYes + TBM_HIVposYes)/2 - (TBM_HIVnegNo + TBM_HIVposNo)/2,
+  Mortality_HIVneg = TBM_HIVnegYes - TBM_HIVnegNo,
+  Mortality_HIVpos = TBM_HIVposYes - TBM_HIVposNo,
+  levels = colnames(design))
+```
+
+## 2. DE testing
+```{r}
+fit <- lmFit(count_data_TBM, design)
+cfit <- contrasts.fit(fit, contrasts=contr.matrix)
+efit <- eBayes(cfit)
+```
+
+
+# 14B Visualize some KEGG
+```{r}
+Exclude_LFU <- TBM_Traits %>% filter(ttdeath < 91 & evdeath==0)
+Exclude_LFU <- rownames(Exclude_LFU)
+
+
+names(TBM_Traits)
+## exclude LFU case
+TBM_Traits <- TBM_Traits %>% 
+  filter(LIMS_ID %nin% Exclude_LFU) %>%
+  filter(Study=="27TB") %>%
+  mutate(evdeath_3M =  factor(evdeath_3M, level=c(0,1), labels = c("No", "Yes")))
+
+TBM_Exp <- TBM_Exp[rownames(TBM_Traits),]
+
+
+
+
+
+## design matrix
+design <- model.matrix(~0 +evdeath_3M +AGE + Treatment, data = TBM_Traits)
+colnames(design) <- gsub("evdeath_3M", "", colnames(design))
+
+
+## constrast matrix
+contr.matrix <- makeContrasts(
+  Mortality = Yes - No,
+  levels = colnames(design))
+
+fit <- lmFit(t(TBM_Exp), design)
+cfit <- contrasts.fit(fit, contrasts=contr.matrix)
+efit <- eBayes(cfit)
+dt <- decideTests(efit)
+df <- topTreat(efit, coef=1, n=Inf)
+
+TNF_signaling <-  get_genelist_pathway_kegg(hsa_ID = "hsa04668")
+
+head()
+df <- df %>% mutate(gene=rownames(df)) %>%
+  filter(gene %in% TNF_signaling)
+
+All_gene_ID <- unlist(mget(df$gene, revmap(org.Hs.egSYMBOL),ifnotfound=NA)) 
+All_gene_ID <- data.frame(gene=names(All_gene_ID),ID= unname(All_gene_ID))
+
+
+
+df <- df %>% merge(.,All_gene_ID, by="gene",all.x=T) %>%
+  subset(!is.na(ID))
+rownames(df) <- df$ID
+
+df_kegg <- df %>% 
+  dplyr::select(logFC) %>% 
+  as.matrix
+
+setwd(paste0(output,"general_output/kegg_figures/"))
+pv.out <- pathview(gene.data = df_kegg, pathway.id = "hsa04668", 
+                   out.suffix ="hsa_TNF_signaling_All_TBM_LFC",
+                   kegg.native = T)
+
+
+df_kegg <- df %>% 
+  dplyr::select(logFC) %>% 
+  as.matrix
+
+setwd(paste0(output,"general_output/kegg_figures/"))
+pv.out <- pathview(gene.data = df_kegg, pathway.id = "hsa04668", 
+                   out.suffix ="hsa_TNF_signaling_All_TBM_LFC",
+                   kegg.native = T)
+
+
+
+```
+
+
+# 15. Drug target for TNF signaling L1000
+```{r}
+source("../R_functions/Function_data_process_and_analysis_8MAR2021.R")
+TNF_signaling <-  get_genelist_pathway_kegg(hsa_ID = "hsa04668")
+
+TNF_signaling_gene <- TBM_Cox %>% filter(gene %in% TNF_signaling) %>% filter(GeneSignificance < 0.05)
+
+
+write.csv(TNF_signaling_gene, file = paste0(output,"general_output/TNF_signaling_gene_p0.05_LINCS_input.csv"))
+```
+
+
+
+# 16. Boostrap AUC performance and Calibration slope addition analysis with dex
+## Functions and data
+
+
+```{r}
+#data set for HIVneg
+
+table(is.na(data_HIVneg$Treatment_Dex))
+table(is.na(data_HIVpos$Treatment_Dex))
+names(data_HIVneg)
+data_HIVneg$SODIUM
+hist(log10(data_HIVneg$totalneutrobl))
+hist(log10(data_HIVneg$CSFLYMTOT))
+hist(data_HIVneg$CSFLYMTOT)
+
+df_HIVneg = cbind(cox_HIVneg,data_HIVneg) %>%
+  mutate(status = factor(evdeath_3M, levels = c(0,1), labels = c("No","Yes")),
+         Log_CSF_Lymp=log10(CSFLYMTOT),
+          Log_BL_Neu= totalneutrobl,
+         History_TBT=factor(History_TBT,levels = c("N","Y")),
+         FOCAL_Neuro=factor(FOCAL_Neuro,levels = c("N","Y"))) %>%
+  filter(!(evdeath_3M == 0 & ttdeath < 97)) %>%
+  dplyr::select( "MCEMP1","TRABD2A","NELL2","PKD1","ZNF354C","CD4","BCL9L",
+                 "evdeath_3M",  "Treatment_Dex","AGE", "History_TBT","TBMGRADE" ,"WEIGHT", "FOCAL_Neuro",
+                 "CSFLYMTOT","Log_CSF_Lymp","Log_BL_Neu","CD4_cells","SODIUM","status")  %>%
+  dplyr::mutate(study="27TB") %>%
+  dplyr::mutate(Treatment_Dex=abs(1-Treatment_Dex))
+
+#data set for HIVneg
+df_HIVpos = cbind(cox_HIVpos,data_HIVpos) %>%
+  mutate(status = factor(evdeath_3M, levels = c(0,1), labels = c("No","Yes")),
+         Log_CSF_Lymp=log10(CSFLYMTOT),
+         History_TBT=factor(History_TBT,levels = c("N","Y")),
+         FOCAL_Neuro=factor(FOCAL_Neuro,levels = c("N","Y"))) %>%
+  filter(!(evdeath_3M == 0 & ttdeath < 97)) %>%
+  dplyr::select( "MCEMP1","TRABD2A","NELL2","PKD1","ZNF354C","CD4","BCL9L",
+                 "evdeath_3M",  "Treatment_Dex","AGE", "History_TBT","TBMGRADE" ,"WEIGHT", "FOCAL_Neuro",
+                 "CSFLYMTOT","Log_CSF_Lymp","Log_BL_Neu","CD4_cells","SODIUM","status") %>%
+  dplyr::mutate(study="26TB")%>%
+  dplyr::mutate(Treatment_Dex=abs(1-Treatment_Dex))
+## fill 1 NA csflymtot by mean of group survival
+Log_CSF_Lymp_mean <- df_HIVpos %>% group_by(evdeath_3M) %>%
+  dplyr::summarise(Mean = mean(Log_CSF_Lymp, na.rm = T)) %>% as.data.frame()
+event_group <- df_HIVpos$evdeath_3M[which(is.na(df_HIVpos$Log_CSF_Lymp))]
+df_HIVpos$Log_CSF_Lymp[which(is.na(df_HIVpos$Log_CSF_Lymp))] <- round(Log_CSF_Lymp_mean$Mean[which(Log_CSF_Lymp_mean$evdeath_3M==event_group)],1)
+
+## fill 1 NA Blood Neutro by mean of group survival
+Log_BL_Neu_mean <- df_HIVneg %>% group_by(evdeath_3M) %>%
+  dplyr::summarise(Mean = mean(Log_BL_Neu, na.rm = T)) %>% as.data.frame()
+event_group <- df_HIVneg$evdeath_3M[which(is.na(df_HIVneg$Log_BL_Neu))]
+
+df_HIVneg$Log_BL_Neu[which(is.na(df_HIVneg$Log_BL_Neu) & df_HIVneg$evdeath_3M==1)] <- round(Log_BL_Neu_mean$Mean[which(Log_BL_Neu_mean$evdeath_3M==1)],1)
+df_HIVneg$Log_BL_Neu[which(is.na(df_HIVneg$Log_BL_Neu) & df_HIVneg$evdeath_3M==0)] <- round(Log_BL_Neu_mean$Mean[which(Log_BL_Neu_mean$evdeath_3M==0)],1)
+
+Log_BL_Sodium_mean <- df_HIVneg %>% group_by(evdeath_3M) %>%
+  dplyr::summarise(Mean = mean(SODIUM, na.rm = T)) %>% as.data.frame()
+df_HIVneg$SODIUM[which(is.na(df_HIVneg$SODIUM) & df_HIVneg$evdeath_3M==1)] <- round(Log_BL_Sodium_mean$Mean[which(Log_BL_Sodium_mean$evdeath_3M==1)],1)
+df_HIVneg$SODIUM[which(is.na(df_HIVneg$SODIUM) & df_HIVneg$evdeath_3M==0)] <- round(Log_BL_Sodium_mean$Mean[which(Log_BL_Sodium_mean$evdeath_3M==0)],1)
+
+## all TBM data
+
+df_All <- rbind(df_HIVneg,df_HIVpos)
+dim(df_HIVneg);dim(df_HIVpos)
+AUC_df_RNAseq <- df_All
+```
+
+
+```{r}
+#install.packages("riskRegression")
+library("riskRegression")
+library(rms)
+set.seed(12345)
+df_HIVneg %<>% dplyr::select(-CD4_cells)
+dd <- datadist(df_All); options( datadist = "dd")
+dd <- datadist(df_HIVneg); options( datadist = "dd")
+dd <- datadist(df_HIVpos); options( datadist = "dd")
+
+```
+
+## Model 0: Thao model 
+
+```{r}
+## create formula 0
+
+
+formula = evdeath_3M ~ AGE + History_TBT + TBMGRADE + Log_CSF_Lymp +Treatment_Dex
+
+# fit = glm(formula, data = df_All,family = "binomial")
+# warning()
+# summary(fit)
+
+# Fit model model 0 All TBM
+model<- lrm(formula, data = df_All, x = TRUE, y = TRUE )
+M0_All <- validate(model,  B = 1000)
+
+# Fit model model 0 HIVneg
+model<- lrm(formula, data = df_HIVneg, x = TRUE, y = TRUE )
+M0_HIVneg <- validate(model,  B = 1000)
+
+# Fit model model 0 HIV positive
+formula = evdeath_3M ~  WEIGHT + TBMGRADE + Log_CSF_Lymp + SODIUM + CD4_cells
+model<- lrm(formula, data = df_HIVpos, x = TRUE, y = TRUE )
+M0_HIVpos <- validate(model,  B = 1000)
+```
+
+
+
+
+## Model 1: MCEMP1 + TRABD2A + CD4
+
+
+```{r}
+## create formula 1
+formula = evdeath_3M ~ MCEMP1 + TRABD2A + CD4 #PKD1 
+
+# Fit model model 1 All TBM
+model<- lrm(formula, data = df_All, x = TRUE, y = TRUE )
+M1_All <- validate(model,  B = 1000)
+
+# Fit model model 1 HIVneg
+model<- lrm(formula, data = df_HIVneg, x = TRUE, y = TRUE )
+M1_HIVneg <- validate(model,  B = 1000)
+
+# Fit model model 1 HIV positive
+model<- lrm(formula, data = df_HIVpos, x = TRUE, y = TRUE )
+M1_HIVpos <- validate(model,  B = 1000)
+```
+
+## Model 2: MCEMP1 + NELL2 + ZNF354C
+ 
+```{r}
+## create formula 2
+formula = evdeath_3M ~ MCEMP1 + NELL2 + ZNF354C
+
+# Fit model model 2 All TBM
+model<- lrm(formula, data = df_All, x = TRUE, y = TRUE )
+M2_All <- validate(model,  B = 1000)
+
+# Fit model model 2 HIVneg
+model<- lrm(formula, data = df_HIVneg, x = TRUE, y = TRUE )
+M2_HIVneg <- validate(model,  B = 1000)
+
+# Fit model model 2 HIV positive
+model<- lrm(formula, data = df_HIVpos, x = TRUE, y = TRUE )
+M2_HIVpos <- validate(model,  B = 1000)
+```
+
+
+## Model 3: MCEMP1 + TRABD2A +  CD4 + AGE + TBMGRADE + Log_CSF_Lymp
+
+```{r}
+## create formula 3
+formula = evdeath_3M ~ MCEMP1 + TRABD2A +  CD4 + AGE + TBMGRADE + Log_CSF_Lymp +Treatment_Dex
+
+# Fit model model 3 All TBM
+model<- lrm(formula, data = df_All, x = TRUE, y = TRUE )
+M3_All <- validate(model,  B = 1000)
+
+# Fit model model 3 HIVneg
+model<- lrm(formula, data = df_HIVneg, x = TRUE, y = TRUE )
+M3_HIVneg <- validate(model,  B = 1000)
+
+# Fit model model 3 HIV positive
+model<- lrm(formula, data = df_HIVpos, x = TRUE, y = TRUE )
+M3_HIVpos <- validate(model,  B = 1000)
+```
+
+## Model 4: MCEMP1 + NELL2 + ZNF354C + AGE + TBMGRADE + Log_CSF_Lymp
+
+```{r}
+## create formula 4
+set.seed(0)
+formula = evdeath_3M ~ MCEMP1 + NELL2 + ZNF354C + AGE + TBMGRADE+Log_CSF_Lymp + Treatment_Dex
+
+# Fit model model 4 All TBM
+model<- lrm(formula, data = df_All, x = TRUE, y = TRUE )
+M4_All <- validate(model,  B = 1000)
+
+# Fit model model 4 HIVneg
+model<- lrm(formula, data = df_HIVneg, x = TRUE, y = TRUE )
+M4_HIVneg <- validate(model,  B = 1000)
+
+# Fit model model 4 HIV positive
+model<- lrm(formula, data = df_HIVpos, x = TRUE, y = TRUE )
+M4_HIVpos <- validate(model,  B = 1000)
+```
+
+
+## Model 5: MCEMP1 + TRABD2A +  CD4 + ZNF354C
+
+```{r}
+## create formula 5
+formula = evdeath_3M ~ MCEMP1 + TRABD2A +  CD4 + ZNF354C
+
+# Fit model model 5 All TBM
+model<- lrm(formula, data = df_All, x = TRUE, y = TRUE )
+M5_All <- validate(model,  B = 1000)
+
+# Fit model model 5 HIVneg
+model<- lrm(formula, data = df_HIVneg, x = TRUE, y = TRUE )
+M5_HIVneg <- validate(model,  B = 1000)
+
+# Fit model model 5 HIV positive
+model<- lrm(formula, data = df_HIVpos, x = TRUE, y = TRUE )
+M5_HIVpos <- validate(model,  B = 1000)
+```
+
+## Model 6: MCEMP1 + NELL2 +  CD4 + ZNF354C
+
+```{r}
+## create formula 6
+set.seed(0)
+formula = evdeath_3M ~ MCEMP1 + NELL2 +  CD4 + ZNF354C
+
+# Fit model model 6 All TBM
+model<- lrm(formula, data = df_All, x = TRUE, y = TRUE )
+M6_All <- validate(model,  B = 1000)
+
+# Fit model model 6 HIVneg
+model<- lrm(formula, data = df_HIVneg, x = TRUE, y = TRUE )
+M6_HIVneg <- validate(model,  B = 1000)
+
+# Fit model model 6 HIV positive
+model<- lrm(formula, data = df_HIVpos, x = TRUE, y = TRUE )
+M6_HIVpos <- validate(model,  B = 1000)
+```
+
+
+## Model 7: MCEMP1 + TRABD2A +  CD4 + ZNF354C + AGE + TBMGRADE + Log_CSF_Lymp
+
+```{r}
+## create formula 7
+formula = evdeath_3M ~ MCEMP1 + TRABD2A +  CD4 + ZNF354C + AGE + TBMGRADE +Log_CSF_Lymp +Treatment_Dex
+
+# Fit model model 7 All TBM
+model<- lrm(formula, data = df_All, x = TRUE, y = TRUE )
+M7_All <- validate(model,  B = 1000)
+
+# Fit model model 7 HIVneg
+model<- lrm(formula, data = df_HIVneg, x = TRUE, y = TRUE )
+M7_HIVneg <- validate(model,  B = 1000)
+
+# Fit model model 7 HIV positive
+model<- lrm(formula, data = df_HIVpos, x = TRUE, y = TRUE )
+M7_HIVpos <- validate(model,  B = 1000)
+```
+
+## Model 8: MCEMP1 + NELL2 +  CD4 + ZNF354C + AGE + TBMGRADE + Log_CSF_Lymp
+
+```{r}
+## create formula 8
+set.seed(0)
+formula = evdeath_3M ~ MCEMP1 + NELL2 +  CD4 + ZNF354C + AGE + TBMGRADE + Log_CSF_Lymp +Treatment_Dex
+
+# Fit model model 8 All TBM
+model<- lrm(formula, data = df_All, x = TRUE, y = TRUE )
+M8_All <- validate(model,  B = 1000)
+
+# Fit model model 8 HIVneg
+model<- lrm(formula, data = df_HIVneg, x = TRUE, y = TRUE )
+M8_HIVneg <- validate(model,  B = 1000)
+
+# Fit model model 8 HIV positive
+model<- lrm(formula, data = df_HIVpos, x = TRUE, y = TRUE )
+M8_HIVpos <- validate(model,  B = 1000)
+```
+
+
+## Model 9 & 10: Neutrophil only
+
+```{r}
+## create formula 9
+names(df_All)
+set.seed(0)
+formula = evdeath_3M ~ Log_BL_Neu
+
+# Fit model model 8 All TBM
+model<- lrm(formula, data = df_All, x = TRUE, y = TRUE )
+M9_All <- validate(model,  B = 1000)
+
+# Fit model model 8 HIVneg
+model<- lrm(formula, data = df_HIVneg, x = TRUE, y = TRUE )
+M9_HIVneg <- validate(model,  B = 1000)
+
+# Fit model model 8 HIV positive
+model<- lrm(formula, data = df_HIVpos, x = TRUE, y = TRUE )
+M9_HIVpos <- validate(model,  B = 1000)
+```
+
+
+
+```{r}
+## create formula 10
+names(df_All)
+set.seed(0)
+formula = evdeath_3M ~ MCEMP1 + NELL2 +  CD4 + ZNF354C + Log_BL_Neu
+
+# Fit model model 8 All TBM
+model<- lrm(formula, data = df_All, x = TRUE, y = TRUE )
+M10_All <- validate(model,  B = 1000)
+
+# Fit model model 8 HIVneg
+model<- lrm(formula, data = df_HIVneg, x = TRUE, y = TRUE )
+M10_HIVneg <- validate(model,  B = 1000)
+
+# Fit model model 8 HIV positive
+model<- lrm(formula, data = df_HIVpos, x = TRUE, y = TRUE )
+M10_HIVpos <- validate(model,  B = 1000)
+```
+
+## Sumary AUC models
+
+```{r eval=FALSE, include=FALSE}
+
+model_col <- c("Thao Model",
+               "Predictors: MCEMP1, TRABD2A, and CD4",
+               "Predictors: MCEMP1 ,NELL2 and ZNF354C",
+               "Predictors: MCEMP1, TRABD2A, CD4 and clinical predictors",
+               "Predictors: MCEMP1 ,NELL2, ZNF354C and clinical predictors",
+               "Predictors: MCEMP1, TRABD2A, CD4 and ZNF354C",
+               "Predictors: MCEMP1 ,NELL2, CD4 and ZNF354C",
+               "Predictors: MCEMP1, TRABD2A, CD4, ZNF354C and clinical predictors", 
+               "Predictors: MCEMP1 ,NELL2, CD4, ZNF354C and clinical predictors",
+               "Predictors:Blood Neutrophil",
+               "Predictors:Blood Neutrophil + Gene set 4")
+## All TBM
+AUC_All <- c(M0_All[,"index.corrected"]["Dxy"], 
+             M1_All[,"index.corrected"]["Dxy"], 
+             M2_All[,"index.corrected"]["Dxy"],
+             M3_All[,"index.corrected"]["Dxy"], 
+             M4_All[,"index.corrected"]["Dxy"],
+             M5_All[,"index.corrected"]["Dxy"], 
+             M6_All[,"index.corrected"]["Dxy"],
+             M7_All[,"index.corrected"]["Dxy"], 
+             M8_All[,"index.corrected"]["Dxy"],
+             M9_All[,"index.corrected"]["Dxy"],
+             M10_All[,"index.corrected"]["Dxy"])
+AUC_All = AUC_All/2 + 0.5
+
+Calib_All <- c(M0_All[,"index.corrected"]["Slope"], 
+               M1_All[,"index.corrected"]["Slope"], 
+               M2_All[,"index.corrected"]["Slope"],
+               M3_All[,"index.corrected"]["Slope"],
+               M4_All[,"index.corrected"]["Slope"],
+               M5_All[,"index.corrected"]["Slope"], 
+               M6_All[,"index.corrected"]["Slope"],
+               M7_All[,"index.corrected"]["Slope"], 
+               M8_All[,"index.corrected"]["Slope"],
+               M9_All[,"index.corrected"]["Slope"],
+               M10_All[,"index.corrected"]["Slope"])
+
+Brier_All <- c(M0_All[,"index.corrected"]["B"], 
+               M1_All[,"index.corrected"]["B"], 
+               M2_All[,"index.corrected"]["B"],
+               M3_All[,"index.corrected"]["B"], 
+               M4_All[,"index.corrected"]["B"],
+               M5_All[,"index.corrected"]["B"], 
+               M6_All[,"index.corrected"]["B"],
+               M7_All[,"index.corrected"]["B"], 
+               M8_All[,"index.corrected"]["B"],
+               M9_All[,"index.corrected"]["B"],
+               M10_All[,"index.corrected"]["B"])
+
+# TBM HIV negative
+
+AUC_HIVneg <- c(M0_HIVneg[,"index.corrected"]["Dxy"], 
+                M1_HIVneg[,"index.corrected"]["Dxy"],
+                M2_HIVneg[,"index.corrected"]["Dxy"],
+                M3_HIVneg[,"index.corrected"]["Dxy"],
+                M4_HIVneg[,"index.corrected"]["Dxy"],
+                M5_HIVneg[,"index.corrected"]["Dxy"],
+                M6_HIVneg[,"index.corrected"]["Dxy"],
+                M7_HIVneg[,"index.corrected"]["Dxy"],
+                M8_HIVneg[,"index.corrected"]["Dxy"],
+                M9_HIVneg[,"index.corrected"]["Dxy"],
+                M10_HIVneg[,"index.corrected"]["Dxy"])
+AUC_HIVneg = AUC_HIVneg/2 + 0.5
+
+Calib_HIVneg <- c(M0_HIVneg[,"index.corrected"]["Slope"], 
+                  M1_HIVneg[,"index.corrected"]["Slope"],
+                  M2_HIVneg[,"index.corrected"]["Slope"],
+                  M3_HIVneg[,"index.corrected"]["Slope"],
+                  M4_HIVneg[,"index.corrected"]["Slope"],
+                  M5_HIVneg[,"index.corrected"]["Slope"],
+                  M6_HIVneg[,"index.corrected"]["Slope"],
+                  M7_HIVneg[,"index.corrected"]["Slope"],
+                  M8_HIVneg[,"index.corrected"]["Slope"],
+                  M9_HIVneg[,"index.corrected"]["Slope"],
+                  M10_HIVneg[,"index.corrected"]["Slope"])
+
+Brier_HIVneg <- c(M0_HIVneg[,"index.corrected"]["B"],
+                  M1_HIVneg[,"index.corrected"]["B"], 
+                  M2_HIVneg[,"index.corrected"]["B"],
+                  M3_HIVneg[,"index.corrected"]["B"], 
+                  M4_HIVneg[,"index.corrected"]["B"],
+                  M5_HIVneg[,"index.corrected"]["B"], 
+                  M6_HIVneg[,"index.corrected"]["B"],
+                  M7_HIVneg[,"index.corrected"]["B"], 
+                  M8_HIVneg[,"index.corrected"]["B"],
+                  M9_HIVneg[,"index.corrected"]["B"],
+                  M10_HIVneg[,"index.corrected"]["B"])
+
+# TBM HIV positive
+AUC_HIVpos <- c(M0_HIVpos[,"index.corrected"]["Dxy"], 
+                M1_HIVpos[,"index.corrected"]["Dxy"],
+                M2_HIVpos[,"index.corrected"]["Dxy"],
+                M3_HIVpos[,"index.corrected"]["Dxy"],
+                M4_HIVpos[,"index.corrected"]["Dxy"],
+                M5_HIVpos[,"index.corrected"]["Dxy"],
+                M6_HIVpos[,"index.corrected"]["Dxy"],
+                M7_HIVpos[,"index.corrected"]["Dxy"],
+                M8_HIVpos[,"index.corrected"]["Dxy"],
+                M9_HIVpos[,"index.corrected"]["Dxy"],
+                M10_HIVpos[,"index.corrected"]["Dxy"])
+AUC_HIVpos = AUC_HIVpos/2 + 0.5
+
+Calib_HIVpos <- c(M0_HIVpos[,"index.corrected"]["Slope"],
+                  M1_HIVpos[,"index.corrected"]["Slope"],
+                  M2_HIVpos[,"index.corrected"]["Slope"],
+                  M3_HIVpos[,"index.corrected"]["Slope"],
+                  M4_HIVpos[,"index.corrected"]["Slope"],
+                  M5_HIVpos[,"index.corrected"]["Slope"],
+                  M6_HIVpos[,"index.corrected"]["Slope"],
+                  M7_HIVpos[,"index.corrected"]["Slope"],
+                  M8_HIVpos[,"index.corrected"]["Slope"],
+                  M9_HIVpos[,"index.corrected"]["Slope"],
+                  M10_HIVpos[,"index.corrected"]["Slope"])
+
+Brier_HIVpos <- c(M0_HIVpos[,"index.corrected"]["B"],
+                  M1_HIVpos[,"index.corrected"]["B"], 
+                  M2_HIVpos[,"index.corrected"]["B"],
+                  M3_HIVpos[,"index.corrected"]["B"], 
+                  M4_HIVpos[,"index.corrected"]["B"],
+                  M5_HIVpos[,"index.corrected"]["B"], 
+                  M6_HIVpos[,"index.corrected"]["B"],
+                  M7_HIVpos[,"index.corrected"]["B"], 
+                  M8_HIVpos[,"index.corrected"]["B"],
+                  M9_HIVpos[,"index.corrected"]["B"],
+                  M10_HIVpos[,"index.corrected"]["B"])
+
+
+summary_AUC <- data.frame(Predictor_set = model_col,AUC_All=AUC_All, Calib_All=Calib_All, Brier_All=Brier_All,
+           AUC_HIVneg=AUC_HIVneg, Calib_HIVneg=Calib_HIVneg, Brier_HIVneg=Brier_HIVneg,
+           AUC_HIVpos=AUC_HIVpos, Calib_HIVpos=Calib_HIVpos, Brier_HIVpos=Brier_HIVpos)
+summary_AUC
+
+#write.csv(summary_AUC, paste0(output,"general_output/","summary_AUC_for_selected_genes_With_Dex.csv"))
+
+```
+
+
+# 17. Prepare input genes list for LINC
+## DEG genes in all TBM
+```{r}
+DEG <- read.csv(paste0(output,"general_output/","Limma_comparition_3M_moratlity_AllTBM.csv")) %>%
+  filter(P.Value < 0.05)
+
+head(DEG)
+```
+
+## Input gene list form selected pathway
+```{r}
+library(readxl)
+input_list <- read_excel(paste0(output,"general_output/supplement_files/","List gene input LINC.xlsx"), sheet="Target_pathway") %>%
+  as.data.frame()
+input_list <-input_list  %>%
+  tidyr::pivot_longer(!stt,names_to = "pathways", values_to = "Gene_symbol")
+
+input_list_df <- input_list %>% 
+  merge(.,DEG, by="Gene_symbol", all.x=T) %>%
+  dplyr::select(-c("pathways","X","stt", "B")) %>%
+  filter(!duplicated(Gene_symbol)) %>%
+  dplyr::filter(adj.P.Val < 0.05) %>%
+  dplyr::mutate(effect=case_when(logFC > 0 ~ "Up",
+                                 logFC < 0 ~ "Down"))
+
+write.csv(input_list_df,paste0(output,"general_output/supplement_files/","input_gene_list_LINC.csv"))
+
+
+
+input_list_df <- input_list %>% 
+  merge(.,DEG, by="Gene_symbol", all.x=T) %>%
+  dplyr::filter(pathways %in% c("Neutrophil_activation", "Accute_inflammation", "TNF_signaling")) %>%
+  dplyr::select(-c("X","stt", "B")) %>%
+  filter(!duplicated(Gene_symbol)) %>%
+  dplyr::filter(adj.P.Val < 0.05) %>%
+  dplyr::mutate(effect=case_when(logFC > 0 ~ "Up",
+                                 logFC < 0 ~ "Down"))
+
+write.csv(input_list_df,paste0(output,"general_output/supplement_files/","input_gene_list_LINC_3_selected_acute_pathway.csv"))
+
+
+  
+
+
+
+
+
+```
+
+

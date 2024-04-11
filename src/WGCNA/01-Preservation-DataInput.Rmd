@@ -1,0 +1,843 @@
+---
+title: 'Mortatlity in TBM based baseline gene expression '
+author: "Haiht"
+date: '2023-03-31'
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+editor_options: 
+  chunk_output_type: console
+---
+
+# Set up R enviroment {.tabset .tabset-fade .tabset-pills}
+Set the random generator seed so we can reproduce exactly results without any stochasticity
+
+```{r setup, message=FALSE, warning=FALSE, echo= FALSE, results='hide'}
+knitr::opts_chunk$set(
+	fig.height = 6,
+	fig.width = 8,
+	message = FALSE,
+	warning = FALSE
+	)
+
+ # Set the random generator seed so we can reproduce exactly results without any stochasticity
+#rm(list=ls())
+set.seed(1235)
+```
+
+
+```{r}
+library(ggplot2)
+library(WGCNA)
+library(Hmisc)
+library(dplyr)
+library(magrittr)
+library(caret)
+library(survival)
+library(survminer)
+source("../R_functions/WGCNA_CEMitool_Allfunctions_5May2022.R")
+#source("../R_functions/WGCNA_CEMitool_Allfunctions_5May2022.R")
+```
+
+# 1. Load input data
+
+## Load gene information
+
+```{r}
+output <- "WGCNA/All_study/Consensus_TBM/Discovery_validation_Dex_HIV/"
+output_figures <- paste0(output,"general_output/figures/")
+study = "TBM_Death_281"
+study_dis = "TBM_Death_discovery"
+study_val = "TBM_Death_validation"
+
+## set multi threads
+enableWGCNAThreads(24)
+
+anno <- "../count_expression/raw_data/GeneAnnotationFile_EnsembltoGeneIds.txt"
+anno <- read.table(anno,header = T)
+
+anno_rRNA <- anno[which(anno$class %in% c("rRNA_pseudogene", "rRNA")),]
+globin_genes <- c("HBA1","HBA2", "HBB", "HBD", "HBE1", "HBG1", "HBG2", "HBM", "HBQ1", "HBZ", "MB")
+anno_globin <- anno[which(anno$gene_symbol %in% globin_genes),]
+Exlcuded_rRNA <- c(as.character(anno_globin$gene_symbol),
+                   as.character(anno_rRNA$gene_symbol))
+
+# subset for genes in chromosome X or Y (n = 2946)
+anno_sex_chr_gene <- anno[which(anno$chr =="Y"|anno$chr =="X"),]
+Exlcuded_sex <- as.character(anno_sex_chr_gene$gene_symbol)
+
+# The following setting is important, do not omit.
+options(stringsAsFactors = FALSE)
+```
+
+
+## Load Combat adjusted expression data
+```{r}
+#Read in the expression data set
+Data <- get(load(file="../General_analysis/RData/gene_clini_adjusted_ComBat_all.Rdata"))
+rownames(Data) <- Data$LIMS_ID
+# Take a quick look at what is in the data set:
+dim(Data);
+names(Data)[1:10]
+## clinical data column
+clini_index <- 1:which(names(Data)=="Run")
+names(Data)[clini_index];
+
+## subset for TBM 
+Data <- subset(Data,Study %in% c("27TB","26TB"))
+```
+
+## Load clinical data
+```{r}
+## import baseline data for 26TB and 27Tb
+load("../clinical_data/process_data/Baseline_26TB_27TB.RData")
+names(Baseline_26TB_27TB)
+
+hist(Baseline_26TB_27TB$NEUTLE)
+table(is.na(Baseline_26TB_27TB$RNA_treatment))
+## select important charactersistic
+Baseline_26TB_27TB %<>% filter(!(is.na(LIMS_ID)|LIMS_ID=="NA")) %>%
+  mutate(LTA4H.rs=ifelse(LTA4H=="CT","TC",LTA4H),
+         RNA_treatment=ifelse(LTA4H=="TT","case",RNA_treatment),
+         Treatment = factor(RNA_treatment, levels=c("case", "control", "test"),
+                            labels =c("case", "control", "case")),
+         Treatment = ifelse(is.na(Treatment),"control",as.character(Treatment)),
+         totalcsfneutro = ifelse(substring(USUBJID,1,3)=="013",NA,totalcsfneutro)) %>% 
+  dplyr::select(LIMS_ID, WEIGHT,Treatment, DIAGNOSTIC_SCORE,LTA4H.rs,SEX,AGE,
+                TBMGRADE,ttdeath,evdeath,WBC,NEUTLE,LYMLE,totalneutrobl,
+                totallymphobl, CSFWBC, CSFLYMLE,CSFLYMTOT,totalcsflympho,
+                totalcsfneutro,CSFGLUC,CSF_BL_GLUC,LACTATE,PROTEIN,History_TBT,
+                FOCAL_Neuro,CD4,SODIUM)
+
+names(Baseline_26TB_27TB) 
+# substring(Baseline_26TB_27TB$USUBJID,1,3) 
+
+table(is.na(Baseline_26TB_27TB$WEIGHT))
+## Merge sequencing infor and clinical data
+trait_var <- c(names(Data[clini_index]))
+
+traitData = Data[,trait_var] %>%
+  mutate(TBM_noHIV = ifelse(Study=="27TB",1,0),
+         TBM_HIV = ifelse(Study=="26TB",1,0),
+         Run = ifelse (Run=="Run1",1,2)) %>%
+  merge(.,Baseline_26TB_27TB, by="LIMS_ID",all.x=T) %>%
+  mutate(diagnosis_TBM=ifelse(DIAGNOSTIC_SCORE=="definite TBM",1,0),
+         TT_LTA4H = ifelse(LTA4H.rs=="TT",1,0),
+         Treatment_Dex = ifelse(Treatment=="case",1,0),
+         ttdeath = as.numeric(ttdeath),
+         Study=factor(Study),
+         evdeath_3M = ifelse(ttdeath > 97,0,evdeath))
+rownames(traitData) <- traitData$LIMS_ID
+
+
+names(traitData)
+# Set the seed for reproducibility in divide into discovery and validation
+set.seed(12345)
+
+# Create a new variable that combines hiv and death status for stratification
+traitData$stratify <- paste(traitData$Study, traitData$evdeath_3M, sep = "_")
+
+# Divide the dataset into a discovery and validation set, with stratification and balancing
+trainIndex <- createDataPartition(traitData$stratify, p = 0.5, list = FALSE, times = 1)
+length(trainIndex)
+
+traitData_dis <- traitData[trainIndex, ]
+traitData_val <- traitData[-trainIndex, ]
+
+## check balance of discovery data and validation data 
+table(traitData_dis$Study); table(traitData_val$Study) 
+table(traitData_dis$Treatment); table(traitData_val$Treatment) 
+table(traitData_dis$TBMGRADE); table(traitData_val$TBMGRADE)
+table(traitData_dis$evdeath_3M); table(traitData_val$evdeath_3M)
+```
+
+# 2. Divide expresion data into discovery and validation cohort
+
+```{r}
+## remove rRNA and HB genes, genes unstable due to method of library preparation
+rRNA_index <- which(colnames(Data) %in% Exlcuded_rRNA)
+sex_index <- which(colnames(Data) %in% Exlcuded_sex) ## may consider to remove sex related genes
+datExpr = as.data.frame(Data[, -c(clini_index,rRNA_index)]);
+
+datExpr_dis <- datExpr[rownames(traitData_dis),]
+datExpr_val <- datExpr[rownames(traitData_val),]
+```
+
+# 3. Check expression data and remove outline samples
+
+```{r}
+# filter for 10% low expressed gene
+datExpr_In <- as.data.frame(t(datExpr))
+datExpr_Inn_F <- t(expr_pct_filter(datExpr_In,pct=0.9))
+
+## get variance of all genes in discovery
+## subset for top highest variance genes
+dv <- NULL
+dv$Symbols <- colnames(datExpr_Inn_F)
+dv$variance <- matrixStats::colVars(as.matrix(datExpr_Inn_F))
+dv <- as.data.frame(dv)
+## sorting gene by var
+dv <- dv[order(dv$variance, decreasing = TRUE),]
+dv$order <- seq(1:nrow(dv))
+
+## plot variance vs order
+jpeg(file = paste0(output_figures,study_dis,"-Variance_data.jpeg"), wi = 5, he = 5,
+    units = 'in',res = 300)
+theme_set(theme_bw(base_size = 10))
+ggplot(dv, aes(x=order,y=variance)) + geom_line() + scale_y_log10() +
+  ggtitle("vst-transformed counts ordered by rowVar")
+dev.off()
+
+# Selected genes in discovery
+n_gene=5000
+selected <- dv$Symbols[1:n_gene] #method 2 choose 5000 genes most variant
+datExpr0_dis <- datExpr_dis[selected]
+dim(datExpr0_dis)
+
+# Selected genes in discovery
+datExpr0_val <- datExpr_val[selected]
+dim(datExpr0_dis)
+
+
+# check input data 
+if(all(rownames(datExpr0_dis) == rownames(traitData_dis)) & all(rownames(datExpr0_val ) == rownames(traitData_val))){
+  datExpr0_dis <- cbind(traitData_dis, datExpr0_dis)
+  datExpr0_val <- cbind(traitData_val, datExpr0_val)
+}
+
+all(colnames(datExpr0_dis)==colnames(datExpr0_val))
+```
+
+
+# 4. Preparation into input list
+
+```{r}
+# We work with two sets:
+nSets = 2;
+# For easier labeling of plots, create a vector holding descriptive names of the two sets.
+setLabels = c("TBM discovery", "TBM validation")
+shortLabels = c("discovery", "validation")
+# Form multi-set expression data: columns starting from 9 contain actual expression data.
+multiExpr = vector(mode = "list", length = nSets)
+
+multiExpr[[1]] = list(data = as.data.frame(datExpr0_dis[-c(1:ncol(traitData_dis))]));
+
+multiExpr[[2]] = list(data =as.data.frame(datExpr0_val[-c(1:ncol(traitData_val))]));
+
+# Check that the data has the correct format for many functions operating on multiple sets:
+exprSize = checkSets(multiExpr)
+```
+
+# 5. Check sample infor
+
+```{r}
+# Check that all genes and samples have sufficiently low numbers of missing values.
+gsg = goodSamplesGenesMS(multiExpr, verbose = 3);
+gsg$allOK
+
+## check sample infor
+if (!gsg$allOK)
+{
+  # Print information about the removed genes:
+  if (sum(!gsg$goodGenes) > 0)
+    printFlush(paste("Removing genes:", paste(names(multiExpr[[1]]$data)[!gsg$goodGenes], 
+                                              collapse = ", ")))
+  for (set in 1:exprSize$nSets)
+  {
+    if (sum(!gsg$goodSamples[[set]]))
+      printFlush(paste("In set", setLabels[set], "removing samples",
+                       paste(rownames(multiExpr[[set]]$data)[!gsg$goodSamples[[set]]], collapse = ", ")))
+    # Remove the offending genes and samples
+    multiExpr[[set]]$data = multiExpr[[set]]$data[gsg$goodSamples[[set]], gsg$goodGenes];
+  }
+  # Update exprSize
+  exprSize = checkSets(multiExpr)
+}
+```
+
+# 6. SampleTrees for discovery and validation
+
+```{r}
+sampleTrees = list()
+for (set in 1:nSets)
+{
+  sampleTrees[[set]] = hclust(dist(multiExpr[[set]]$data), method = "average")
+}
+
+
+par(mfrow=c(2,1),mar = c(0, 4, 2, 0))
+for (set in 1:nSets)
+  plot(sampleTrees[[set]], main = paste("Sample clustering on all genes in", setLabels[set]),
+       xlab="", sub="", cex = 0.7);
+
+# Choose the "base" cut height for the discovery data set
+baseHeight = 160
+#Adjust the cut height for the validation data set for the number of samples
+cutHeights = c(baseHeight, baseHeight*exprSize$nSamples[2]/exprSize$nSamples[1]);
+#cutHeights <- c(120,130)
+
+# Re-plot the dendrograms including the cut lines
+
+jpeg(file =  paste0(output_figures,"samples_hierarchical_clustering.jpeg"), wi = 7, 
+     he = 7, units = "in",res=480)
+par(mfrow=c(2,1),mar = c(0, 4, 2, 0))
+for (set in 1:nSets)
+{
+  plot(sampleTrees[[set]], main = paste("Sample clustering on all genes in", setLabels[set]),
+       xlab="", sub="", cex = 0.7);
+  abline(h=cutHeights[set], col = "red");
+}
+
+## remove outlier samples higher then cutHeights
+for (set in 1:nSets)
+{
+  # Find clusters cut by the line
+  labels = cutreeStatic(sampleTrees[[set]], cutHeight =cutHeights[set] )
+  # Keep the largest one (labeled by the number 1)
+  keep = (labels==1)
+  if(all(labels==0)) keep <- rep(TRUE,length(labels))
+  multiExpr[[set]]$data = multiExpr[[set]]$data[keep, ]
+}
+dev.off()
+collectGarbage();
+# Check the size of the leftover data
+exprSize = checkSets(multiExpr)
+exprSize
+
+## create trait data 
+traitData <- rbind(traitData_dis,traitData_val)
+## divide trait data in discovery and validation data set and just keep samples below cut height cutoff of tree 
+Traits = vector(mode="list", length = nSets);
+for (set in 1:nSets){
+  setSamples = rownames(multiExpr[[set]]$data);
+  traitRows = match(setSamples, rownames(traitData));
+  Traits[[set]] = list(data = traitData[traitRows,]);
+  rownames(Traits[[set]]$data) = rownames(traitData[traitRows,]);
+}
+
+names(traitData)
+collectGarbage();
+# Define data set dimensions
+nGenes = exprSize$nGenes;
+nSamples = exprSize$nSamples
+```
+
+
+
+# 7. Save RData for post analysis
+
+```{r}
+output <- "WGCNA/All_study/Consensus_TBM/Discovery_validation_Dex_HIV/"
+output_figures <- paste0(output,"general_output/figures/")
+study = "TBM_Death_281"
+study_dis = "TBM_Death_discovery"
+study_val = "TBM_Death_validation"
+
+save(datExpr,output,output_figures, study, study_dis, study_val, multiExpr, Traits, 
+     nGenes, nSamples, setLabels, shortLabels, exprSize,
+     file = paste0(output,"RData/",study,"-01-dataInput.RData"))
+
+names(Traits[[1]]$data)
+
+```
+
+
+## 8 Summary statistic
+
+
+```{r}
+
+names(Traits[[set]]$data)
+library(gtsummary)
+library(flextable)
+label_list=list(AGE~"Age (years) – median(IQR)",
+                SEX ~ "Male sex – n(%)",
+                TBMGRADE ~ "BMRC grade* - n(%)",
+                DIAGNOSTIC_SCORE ~ "Diagnostic category** – n(%)",
+                History_TBT~ " History of TB treatment - n(%)",
+                LTA4H.rs ~ "LTA4H genotype - no. (%)",
+                WBC~ "Leucocytes (x 10^6 cells/ml) - median(IQR)",
+                totalneutrobl ~ "Neutrophils (x 10^6 cells/ml) - median(IQR)",
+                totallymphobl ~ "Lymphocytes (x 10^6 cells/ml) - median(IQR)",
+                # PLAT ~ "Platelets (x 10^6 cells/ml) - median(IQR)",
+                SODIUM~ "Sodium (MmEq/L) - median(IQR)",
+                CSFWBC ~ "Leucocytes total (x 10^3 cells/ml) - median(IQR)",
+                totalcsfneutro ~ "Neutrophils (x 10^3 cells/ml) - median(IQR)",
+                totalcsflympho ~ "Lymphocytes (x 10^3 cells/ml) - median(IQR)",
+                PROTEIN ~ "Protein (g/l) - median(IQR)",
+                LACTATE ~ "Lactate (mmol/l) - median(IQR)",
+                CSFGLUC ~ "Glucose (mmol/l) - median(IQR)")
+
+
+```
+
+
+```{r eval=FALSE, include=FALSE}
+studyAll <- c("TBM_Death_discovery","TBM_Death_validation")
+for (set in 1:nSets){
+Traits[[set]]$data %>% dplyr::select(evdeath_3M,AGE,SEX,TBMGRADE,DIAGNOSTIC_SCORE,History_TBT,
+                                     LTA4H.rs,WBC,totalneutrobl,totallymphobl,
+                                      CSFWBC,totalcsfneutro,totalcsflympho,PROTEIN,LACTATE,
+                                     CSFGLUC) %>%
+  tbl_summary(
+    by = evdeath_3M, # split table by group
+    missing = "no" , # don't list missing data separately,
+    label=label_list
+  ) %>%
+  add_n() %>% # add column with total number of non-missing observations
+  add_p() %>% # test for a difference between groups
+  modify_header(label = "**Variable**") %>% # update the column header
+  bold_labels() %>% as_flex_table() %>% save_as_docx(path =paste0(output,"general_output/Descriptive_",studyAll[set],".docx"))
+}
+
+```
+
+## All TBM
+```{r}
+library(survival)
+All_TBM <- traitData %>% 
+  mutate(Study=factor(Study,levels = c("27TB", "26TB")),
+         TBMGRADE=factor(TBMGRADE),
+         WBC = log10(WBC),
+         totalneutrobl = log10(totalneutrobl),
+         totallymphobl = log10(totallymphobl),
+         CSFWBC= log10(CSFWBC),
+         totalcsfneutro= log10(totalcsfneutro),
+         totalcsflympho= log10(totalcsflympho))
+
+
+tab1 <- All_TBM %>%
+  dplyr::select(AGE,SEX,Study,TBMGRADE,DIAGNOSTIC_SCORE,History_TBT,
+                                     LTA4H.rs,WBC,totalneutrobl,totallymphobl,SODIUM,
+                                      CSFWBC,totalcsfneutro,totalcsflympho,PROTEIN,LACTATE,
+                                     CSFGLUC,evdeath_3M) %>%
+  tbl_summary(
+    #by = evdeath_3M, # split table by group
+    missing = "no" , # don't list missing data separately,
+    label=label_list
+  ) %>%
+  add_n() %>% # add column with total number of non-missing observations
+  modify_header(label = "**Variable**") %>% # update the column header
+  bold_labels() 
+tab2 <- All_TBM %>%
+  mutate(ttdeath_3M = ifelse(ttdeath > 97,97,ttdeath))  %>%
+  dplyr::select(evdeath_3M,ttdeath_3M,AGE,SEX,Study,TBMGRADE,DIAGNOSTIC_SCORE,History_TBT,
+                                     LTA4H.rs,WBC,totalneutrobl,totallymphobl,SODIUM,
+                                      CSFWBC,totalcsfneutro,totalcsflympho,PROTEIN,LACTATE,
+                                     CSFGLUC) %>%
+  tbl_uvregression(method = coxph,
+                   y = Surv(ttdeath_3M, evdeath_3M),
+                   exponentiate = TRUE,
+                   hide_n = TRUE,
+                   label= label_list
+  )
+```
+
+## Discovery
+```{r}
+Discovery <- Traits[[1]]$data %>%
+  mutate(Study=factor(Study,levels = c("27TB", "26TB")),
+         TBMGRADE=factor(TBMGRADE),
+         WBC = log10(WBC),
+         totalneutrobl = log10(totalneutrobl),
+         totallymphobl = log10(totallymphobl),
+         CSFWBC= log10(CSFWBC),
+         totalcsfneutro= log10(totalcsfneutro),
+         totalcsflympho= log10(totalcsflympho))
+  
+tab3 <-  Discovery %>%
+  dplyr::select(AGE,SEX,Study,TBMGRADE,DIAGNOSTIC_SCORE,History_TBT,
+                                     LTA4H.rs,WBC,totalneutrobl,totallymphobl,SODIUM,
+                                      CSFWBC,totalcsfneutro,totalcsflympho,PROTEIN,LACTATE,
+                                     CSFGLUC,evdeath_3M) %>%
+  tbl_summary(
+    #by = evdeath_3M, # split table by group
+    missing = "no" , # don't list missing data separately,
+    label=label_list
+  ) %>%
+  add_n() %>% # add column with total number of non-missing observations
+  modify_header(label = "**Variable**") %>% # update the column header
+  bold_labels() 
+
+tab4 <- Discovery %>%
+  mutate(ttdeath_3M = ifelse(ttdeath > 97,98,ttdeath))  %>%
+  dplyr::select(evdeath_3M,ttdeath_3M,AGE,SEX,Study,TBMGRADE,DIAGNOSTIC_SCORE,History_TBT,
+                                     LTA4H.rs,WBC,totalneutrobl,totallymphobl,SODIUM,
+                                      CSFWBC,totalcsfneutro,totalcsflympho,PROTEIN,LACTATE,
+                                     CSFGLUC) %>%
+  tbl_uvregression(method = coxph,
+                   y = Surv(ttdeath_3M, evdeath_3M),
+                   exponentiate = TRUE,
+                   hide_n = TRUE,
+                   label= label_list
+  )
+
+```
+
+## Validation
+```{r}
+Validation <- Traits[[2]]$data %>%
+  mutate(Study=factor(Study,levels = c("27TB", "26TB")),
+         TBMGRADE=factor(TBMGRADE),
+         WBC = log10(WBC),
+         totalneutrobl = log10(totalneutrobl),
+         totallymphobl = log10(totallymphobl),
+         CSFWBC= log10(CSFWBC),
+         totalcsfneutro= log10(totalcsfneutro),
+         totalcsflympho= log10(totalcsflympho))
+
+
+tab5 <- Validation %>%
+  dplyr::select(AGE,SEX,Study,TBMGRADE,DIAGNOSTIC_SCORE,History_TBT,
+                                     LTA4H.rs,WBC,totalneutrobl,totallymphobl,SODIUM,
+                                      CSFWBC,totalcsfneutro,totalcsflympho,PROTEIN,LACTATE,
+                                     CSFGLUC,evdeath_3M) %>%
+  tbl_summary(
+    #by = evdeath_3M, # split table by group
+    missing = "no" , # don't list missing data separately,
+    label=label_list
+  ) %>%
+  add_n() %>% # add column with total number of non-missing observations
+  modify_header(label = "**Variable**") %>% # update the column header
+  bold_labels() 
+
+tab6 <- Validation %>%
+  mutate(ttdeath_3M = ifelse(ttdeath > 97,98,ttdeath))  %>%
+  dplyr::select(evdeath_3M,ttdeath_3M,AGE,SEX,Study,TBMGRADE,DIAGNOSTIC_SCORE,History_TBT,
+                                     LTA4H.rs,WBC,totalneutrobl,totallymphobl,SODIUM,
+                                      CSFWBC,totalcsfneutro,totalcsflympho,PROTEIN,LACTATE,
+                                     CSFGLUC) %>%
+  tbl_uvregression(method = coxph,
+                   y = Surv(ttdeath_3M, evdeath_3M),
+                   exponentiate = TRUE,
+                   hide_n = TRUE,
+                   label= label_list
+  )
+
+```
+
+## Merge table
+```{r}
+# install.packages("devtools")
+# devtools::install_github("Sebastien-Le/YesSiR")
+library("YesSiR")
+library(officer)
+tbl_merge_tab <-
+  tbl_merge(
+    tbls = list(tab1, tab2,tab3,tab4,tab5,tab6),
+    tab_spanner = c("**All TBM**","3-month Mortality", 
+                    "**Discovery**","3-month Mortality",
+                    "**Validation**","3-month Mortality")
+  )
+
+tbl_merge_tab %>% as_flex_table() %>% exportxlsx(path =paste0(output,
+                                                              "general_output/Descriptive_3M_Mortality_N.xlsx"))
+
+
+sect_properties <- prop_section(
+  page_size = page_size(
+    orient = "landscape",
+    width = 20, height = 20
+  ),
+  type = "continuous",
+  page_margins = page_mar()
+)
+```
+
+
+# 9 Volcano plot
+
+```{r}
+#Read in the expression data set
+Data <- get(load(file="../General_analysis/RData/count_data_adjusted_ComBat.Rdata"))
+rownames(Data) <- Data$LIMS_ID
+## remove rRNA and HB genes, genes unstable due to method of library preparation
+rRNA_index <- which(colnames(Data) %in% Exlcuded_rRNA)
+sex_index <- which(colnames(Data) %in% Exlcuded_sex) ## may consider to remove sex related genes
+datExpr = as.data.frame(Data[rownames(traitData), -c(rRNA_index)]) %>%
+  dplyr::select(-LIMS_ID);
+
+
+
+TBM_Traits <- rbind(Traits[[1]]$data,
+                    Traits[[2]]$data) %>%
+  filter(Study=="27TB")
+
+TBM_Exp <- datExpr[rownames(TBM_Traits),]
+
+pheno_name="evdeath_3M"
+pheno_index = c(which(names(TBM_Traits) %in% c("ttdeath","evdeath")),
+                which(names(TBM_Traits) %in% c("AGE", "Treatment")))
+
+TBM_Cox <- get_GSCox_WGCNA(Expr = TBM_Exp,pheno =TBM_Traits,pheno_index = pheno_index,evdays=97,covar = NULL)
+
+TBM_Cox$p_adjusted <- p.adjust(TBM_Cox$GeneSignificance, method = "BH")
+TBM_Cox$log_GeneEffect <- log(TBM_Cox$GeneEffect)
+
+
+cols <- c("TNF signaling \n(Up-regulated)" = "#c73912", "TNF signaling \n(Down-regulated)" = "forestgreen", 
+          "TNF signaling \n(non-significant)"= "azure4","TNF"="#22a1e0")
+cols <- c("TNF signaling \n(Up-regulated)" = "#c73912", "TNF signaling \n(Down-regulated)" = "forestgreen", 
+          "TNF \nnon-significant"="#22a1e0")
+
+dat_plot<- TBM_Cox %>%
+  mutate(color_map = case_when(p_adjusted < 0.05 & Gene %in% TNF_signaling & log_GeneEffect > 0 ~ "TNF signaling \n(Up-regulated)",
+                               p_adjusted < 0.05 & Gene %in% TNF_signaling & log_GeneEffect < 0 ~ "TNF signaling \n(Down-regulated)",
+                               Gene=="TNF"~ "TNF \nnon-significant",
+                               #p_adjusted >= 0.05 & Gene %in% TNF_signaling ~ "TNF signaling \n(non-significant)",
+                               .default = NA))
+
+tezz<- filter(dat_plot, is.na(color_map)== FALSE)
+
+# significant name
+vol_plot <- dat_plot %>%
+  ggplot(aes(x = log(GeneEffect), #-log10
+             y = -log10(GeneSignificance),
+             color = color_map)) + 
+  geom_point(alpha=1)+
+  scale_color_manual(values = cols) +
+  geom_label_repel(data = tezz, # Add labels last to appear as the top layer
+                   aes(label = Gene),
+                   force = 0.5,
+                   nudge_y = 0.5,
+                   max.overlaps = Inf) +
+  geom_hline(yintercept = -log10(0.05),
+             linetype = "dashed") +
+  labs(title = "Volcano plot: Cox regression for 3M survival \nTNF signaling pathway",
+       x = "log(HR)",
+       y = "-log10(P-value)",
+       colour = "Pathway:") +
+  scale_x_continuous(breaks = c(seq(-4, 2, 1)), # Modify x-axis tick intervals
+                     limits = c(-2, 2)) +
+  scale_y_continuous(breaks = c(seq(0, 7, 1)), # Modify x-axis tick intervals
+                     limits = c(0, 8)) +
+  theme_bw() + # Select theme with a white background
+  theme(panel.border = element_rect(colour = "black", fill = NA, size= 0.5),    
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank()) 
+
+jpeg(file =  paste0(output,"/general_output/figures/TNF_signaling_Volcano.jpeg"), wi = 7, 
+     he = 5, units = "in",res=480)
+vol_plot
+dev.off()
+```
+
+
+# 10 Volcano plot TNF signaling only
+
+```{r}
+#Read in the expression data set
+Data <- get(load(file="../General_analysis/RData/count_data_adjusted_ComBat.Rdata"))
+rownames(Data) <- Data$LIMS_ID
+## remove rRNA and HB genes, genes unstable due to method of library preparation
+rRNA_index <- which(colnames(Data) %in% Exlcuded_rRNA)
+sex_index <- which(colnames(Data) %in% Exlcuded_sex) ## may consider to remove sex related genes
+datExpr = as.data.frame(Data[rownames(traitData), -c(rRNA_index)]) %>%
+  dplyr::select(-LIMS_ID);
+
+
+
+TBM_Traits <- rbind(Traits[[1]]$data,
+                    Traits[[2]]$data) %>%
+  filter(Study=="27TB")
+
+TBM_Exp <- datExpr[rownames(TBM_Traits),]
+
+pheno_name="evdeath_3M"
+pheno_index = c(which(names(TBM_Traits) %in% c("ttdeath","evdeath")),
+                which(names(TBM_Traits) %in% c("AGE", "Treatment")))
+
+TBM_Cox <- get_GSCox_WGCNA(Expr = TBM_Exp,pheno =TBM_Traits,pheno_index = pheno_index,evdays=97,covar = NULL)
+```
+
+
+```{r}
+library(ggrepel)
+source("../R_functions/Function_data_process_and_analysis_8MAR2021.R")
+# select genes in infalmmatory response
+GOBP <- read.gmt("Pathway_database/GO_Biological_Process_2021.gmt")
+GOBP_name <- names(GOBP)
+rename_GO <- function(x){
+  as.character(strsplit(x,split=" (GO:",fixed=TRUE)[[1]][1])
+}
+names(GOBP) <- as.character(lapply(GOBP_name,rename_GO))
+
+#Inflammatory_repsponse <- unname(unlist(GOBP["inflammatory response"]))
+Inflammatory_repsponse <-  get_genelist_pathway(name="inflammatory response")
+Immune_repsponse <- get_genelist_pathway(name="immune response")
+TNF_signaling <-  get_genelist_pathway_kegg(hsa_ID = "hsa04668")
+
+length(Immune_repsponse)
+length(which(TNF_signaling %in% Inflammatory_repsponse))
+length(which(TNF_signaling %in% Immune_repsponse))
+
+TNF_Cox <- TBM_Cox %>% filter(Gene %in% Immune_repsponse)
+dim(TNF_Cox)
+length(which(TNF_Cox$Gene %in% TNF_signaling))
+
+TNF_Cox <- TBM_Cox %>% filter(Gene %in% Inflammatory_repsponse)
+dim(TNF_Cox)
+length(which(TNF_Cox$Gene %in% TNF_signaling))
+
+
+
+TNF_Cox$p_adjusted <- p.adjust(TNF_Cox$GeneSignificance, method = "BH")
+TNF_Cox$log_GeneEffect <- log(TNF_Cox$GeneEffect)
+
+
+cols <- c("TNF signaling \n(Up-regulated)" = "#c73912", "TNF signaling \n(Down-regulated)" = "forestgreen", 
+          "TNF\n(significant)"="#22a1e0","TNF\n(non-significant)"="#22a1e0")
+
+dat_plot<- TNF_Cox %>%
+  mutate(color_map = case_when(p_adjusted < 0.05 & Gene %in% TNF_signaling & log_GeneEffect > 0 ~ "TNF signaling \n(Up-regulated)",
+                               p_adjusted < 0.05 & Gene %in% TNF_signaling & log_GeneEffect < 0 ~ "TNF signaling \n(Down-regulated)",
+                               #p_adjusted >= 0.05 & Gene %in% TNF_signaling ~ "TNF signaling \n(non-significant)",
+                               .default = NA)) %>%
+  mutate(color_map = ifelse(Gene=="TNF" & p_adjusted < 0.05, "TNF\n(significant)",
+                            ifelse(Gene=="TNF" & p_adjusted > 0.05,"TNF\n(non-significant)",color_map )))
+
+tezz<- filter(dat_plot, is.na(color_map)== FALSE)
+dat_plot_sig <- dat_plot %>% filter(p_adjusted < 0.05 & Gene %in% TNF_signaling)
+
+# significant name
+vol_plot <- dat_plot %>%
+  ggplot(aes(x = log(GeneEffect), #-log10
+             y = -log10(GeneSignificance),
+             color = color_map)) + 
+  geom_point(alpha=0.7, size=1.5)+
+  geom_point(data=dat_plot_sig, aes(x=log(GeneEffect), y =-log10(GeneSignificance)),size=3)+
+  
+  scale_color_manual(values = cols) +
+  geom_label_repel(data = tezz, # Add labels last to appear as the top layer
+                   aes(label = Gene),
+                   force = 0.5,
+                   nudge_y = 0.5,
+                   max.overlaps = Inf) +
+  geom_hline(yintercept = -log10(0.05),
+             linetype = "dashed") +
+  labs(title = "Volcano plot: Cox regression for 3M survival \nTNF signaling pathway",
+       x = "log(HR)",
+       y = "-log10(P-value)",
+       colour = "Pathway:") +
+  scale_x_continuous(breaks = c(seq(-4, 2, 1)), # Modify x-axis tick intervals
+                     limits = c(-2, 2)) +
+  scale_y_continuous(breaks = c(seq(0, 7, 1)), # Modify x-axis tick intervals
+                     limits = c(0, 8)) +
+  theme_bw() + # Select theme with a white background
+  theme(plot.title = element_text(size = 20),
+        legend.position = "right",
+        legend.text = element_text(size = 20) ,
+        legend.title  = element_text(size = 20,color="black",face="bold"),
+        #axis.text = element_text(size = 25),
+        axis.text.x=element_text(color="black",size=15,face="bold"),
+        axis.title.x = element_text(size = 20,color="black",face="bold"),
+        axis.text.y=element_text(color="black",size=15,face="bold"),
+        axis.title.y = element_text(size = 20,color="black",face="bold"),
+        axis.title= element_text(size = 20,color="black",face="bold")) 
+
+jpeg(file =  paste0(output,"/general_output/figures/TNF_signaling_Volcano_immune_response.jpeg"), wi = 7, 
+     he = 5, units = "in",res=480)
+vol_plot
+dev.off()
+```
+
+```{r}
+TNF_Cox <- TBM_Cox %>% filter(Gene %in% Inflammatory_repsponse)
+dim(TNF_Cox)
+
+TNF_Cox$p_adjusted <- p.adjust(TNF_Cox$GeneSignificance, method = "BH")
+TNF_Cox$log_GeneEffect <- log(TNF_Cox$GeneEffect)
+
+
+cols <- c("TNF signaling \n(Up-regulated)" = "#c73912", "TNF signaling \n(Down-regulated)" = "forestgreen", 
+          "TNF\n(significant)"="#22a1e0","TNF\n(non-significant)"="#22a1e0")
+
+dat_plot<- TNF_Cox %>%
+  mutate(color_map = case_when(p_adjusted < 0.05 & Gene %in% TNF_signaling & log_GeneEffect > 0 ~ "TNF signaling \n(Up-regulated)",
+                               p_adjusted < 0.05 & Gene %in% TNF_signaling & log_GeneEffect < 0 ~ "TNF signaling \n(Down-regulated)",
+                               #p_adjusted >= 0.05 & Gene %in% TNF_signaling ~ "TNF signaling \n(non-significant)",
+                               .default = NA)) %>%
+  mutate(color_map = ifelse(Gene=="TNF" & p_adjusted < 0.05, "TNF\n(significant)",
+                            ifelse(Gene=="TNF" & p_adjusted > 0.05,"TNF\n(non-significant)",color_map )))
+
+tezz<- filter(dat_plot, is.na(color_map)== FALSE)
+dat_plot_sig <- dat_plot %>% filter(p_adjusted < 0.05 & Gene %in% TNF_signaling)
+
+# significant name
+vol_plot <- dat_plot %>%
+  ggplot(aes(x = log(GeneEffect), #-log10
+             y = -log10(GeneSignificance),
+             color = color_map)) + 
+  geom_point(alpha=0.7, size=1.5)+
+  geom_point(data=dat_plot_sig, aes(x=log(GeneEffect), y =-log10(GeneSignificance)),size=3)+
+  
+  scale_color_manual(values = cols) +
+  geom_label_repel(data = tezz, # Add labels last to appear as the top layer
+                   aes(label = Gene),
+                   force = 0.5,
+                   nudge_y = 0.5,
+                   max.overlaps = Inf) +
+  geom_hline(yintercept = -log10(0.05),
+             linetype = "dashed") +
+  labs(title = "Volcano plot: Cox regression for 3M survival \nTNF signaling pathway",
+       x = "log(HR)",
+       y = "-log10(P-value)",
+       colour = "Pathway:") +
+  scale_x_continuous(breaks = c(seq(-4, 2, 1)), # Modify x-axis tick intervals
+                     limits = c(-2, 2)) +
+  scale_y_continuous(breaks = c(seq(0, 7, 1)), # Modify x-axis tick intervals
+                     limits = c(0, 8)) +
+  theme_bw() + # Select theme with a white background
+  theme(plot.title = element_text(size = 25),
+        legend.position = "none",
+        legend.text = element_text(size = 20) ,
+        legend.title  = element_text(size = 20,color="black",face="bold"),
+        #axis.text = element_text(size = 25),
+        axis.text.x=element_text(color="black",size=15,face="bold"),
+        axis.title.x = element_text(size = 20,color="black",face="bold"),
+        axis.text.y=element_text(color="black",size=15,face="bold"),
+        axis.title.y = element_text(size = 20,color="black",face="bold"),
+        axis.title= element_text(size = 40,color="black",face="bold")) 
+
+jpeg(file =  paste0(output,"/general_output/figures/TNF_signaling_Volcano_Inflammatory_response.jpeg"), wi = 7, 
+     he = 5, units = "in",res=480)
+vol_plot
+dev.off()
+```
+
+
+```{r}
+TNF_Cox <- TBM_Cox %>% filter(Gene %in% Inflammatory_repsponse)
+dim(TNF_Cox)
+
+TNF_Cox$p_adjusted <- p.adjust(TNF_Cox$GeneSignificance, method = "BH")
+TNF_Cox$log_GeneEffect <- log(TNF_Cox$GeneEffect)
+
+
+cols <- c("TNF signaling \n(Up-regulated)" = "#c73912", "TNF signaling \n(Down-regulated)" = "forestgreen", 
+          "TNF\n(significant)"="#22a1e0","TNF\n(non-significant)"="#22a1e0")
+
+dat_plot<- TNF_Cox %>%
+  mutate(color_map = case_when(p_adjusted < 0.05 & Gene %in% TNF_signaling & log_GeneEffect > 0 ~ "TNF signaling \n(Up-regulated)",
+                               p_adjusted < 0.05 & Gene %in% TNF_signaling & log_GeneEffect < 0 ~ "TNF signaling \n(Down-regulated)",
+                               #p_adjusted >= 0.05 & Gene %in% TNF_signaling ~ "TNF signaling \n(non-significant)",
+                               .default = NA)) %>%
+  mutate(color_map = ifelse(Gene=="TNF" & p_adjusted < 0.05, "TNF\n(significant)",
+                            ifelse(Gene=="TNF" & p_adjusted > 0.05,"TNF\n(non-significant)",color_map ))) %>%
+  mutate(size_point= case_when(color_map=="TNF signaling \n(Up-regulated)"~1.2,
+                         color_map=="TNF signaling \n(Down-regulated)"~1.2,
+                         color_map=="TNF\n(significant)"~1.2, 
+                         .default=1.1))
+
+dat_plot_sig <- dat_plot %>% filter(p_adjusted < 0.05 & Gene %in% TNF_signaling)
+
+tezz<- filter(dat_plot, is.na(color_map)== FALSE)
+
+# significant name
+ 
+```
+

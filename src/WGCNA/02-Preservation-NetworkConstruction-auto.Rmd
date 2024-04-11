@@ -1,0 +1,239 @@
+---
+title: 'Mortatlity in TBM based baseline gene expression '
+author: "Haiht"
+date: '2023-03-31'
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+editor_options: 
+  chunk_output_type: console
+---
+
+# Set up R enviroment {.tabset .tabset-fade .tabset-pills}
+Set the random generator seed so we can reproduce exactly results without any stochasticity
+
+```{r setup, message=FALSE, warning=FALSE, echo= FALSE, results='hide'}
+knitr::opts_chunk$set(
+	fig.height = 6,
+	fig.width = 8,
+	message = FALSE,
+	warning = FALSE
+	)
+
+ # Set the random generator seed so we can reproduce exactly results without any stochasticity
+#rm(list=ls())
+set.seed(1235)
+```
+
+
+```{r}
+library(ggplot2)
+library(WGCNA)
+library(Hmisc)
+library(dplyr)
+library(magrittr)
+library(caret)
+source("../R_functions/WGCNA_CEMitool_Allfunctions_5May2022.R")
+#source("../R_functions/WGCNA_CEMitool_Allfunctions_5May2022.R")
+```
+
+# 1. Load input data
+
+```{r}
+## set multi threads
+enableWGCNAThreads(nThreads=12)
+# Load the data saved in the first part
+output <- "WGCNA/All_study/Consensus_TBM/Discovery_validation_Dex_HIV/"
+study = "TBM_Death_281"
+lnames = load( paste0(output,"RData/",study,"-01-dataInput.RData"));
+# The variable lnames contains the names of loaded variables.
+lnames
+
+# Get the number of sets in the multiExpr structure.
+dim(multiExpr[[1]]$data)
+nSets = checkSets(multiExpr)$nSets
+```
+
+# 2. Pick softthreshold
+
+```{r}
+# Choose a set of soft-thresholding powers
+powers = c(1:20);
+# Call the network topology analysis function
+sft = pickSoftThreshold(multiExpr[[1]]$data, powerVector = powers, verbose = 5)
+# Plot the results:
+sizeGrWindow(9, 5)
+jpeg(file = paste0(output_figures,study_dis,"-scaleFreeAnalysis.jpeg"), wi = 9, he = 5,
+    units = 'in',res = 300)
+par(mfrow = c(1,2));
+cex1 = 0.85;
+# Scale-free topology fit index as a function of the soft-thresholding power
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     xlab="Soft Threshold (power)",ylab="Scale Free Topology Model Fit,signed R^2",type="n",
+     main = paste("Scale independence"));
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     labels=powers,cex=cex1,col="red");
+# this line corresponds to using an R^2 cut-off of h
+abline(h=0.9,col="red")
+# Mean connectivity as a function of the soft-thresholding power
+plot(sft$fitIndices[,1], sft$fitIndices[,5],
+     xlab="Soft Threshold (power)",ylab="Mean Connectivity", type="n",
+     main = paste("Mean connectivity"))
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, cex=cex1,col="red")
+
+dev.off();
+sft$fitIndices[,5][8:15]
+```
+# 3. Construct network
+
+```{r}
+power=sft$powerEstimate
+#(with mean conectivity = 14.993420)
+net_dis = blockwiseModules(multiExpr[[1]]$data, power = power,
+                       maxBlockSize = 5000,
+                       networkType="unsigned",
+                       TOMType = "signed", minModuleSize = 30,
+                       reassignThreshold = 0, mergeCutHeight = 0.3,
+                       numericLabels = TRUE, pamRespectsDendro = FALSE,
+                       saveTOMs = TRUE,
+                       saveTOMFileBase = paste0(output,"RData/",study_dis,"-TOM_5000"), 
+                       verbose = 3)
+```
+
+# 4.Plot dendrogram network
+
+```{r}
+# open a graphics window
+mergedColors = labels2colors(net_dis$colors)
+jpeg(file = paste0(output_figures,study_dis,"_Dendrogram-auto.jpeg"), wi = 12, he = 9,units = 'in', res = 480)
+sizeGrWindow(12, 9)
+plotDendroAndColors(net_dis$dendrograms[[1]], mergedColors[net_dis$blockGenes[[1]]],
+                    "Module colors",
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05,
+                    main = "Gene dendrogram and module colors")
+dev.off()
+
+```
+
+# 5. Save RData for other analysis.
+
+```{r}
+moduleLabels_dis = net_dis$colors
+labels2colors(unique(net_dis$colors))
+
+moduleColors_dis = labels2colors(net_dis$colors)
+
+MEs_dis = net_dis$MEs;
+geneTree_dis = net_dis$dendrograms[[1]];
+save(net_dis,MEs_dis, moduleLabels_dis, moduleColors_dis, geneTree_dis, 
+     file = paste0(output,"RData/",study_dis,"-02-networkConstruction-auto.RData"))
+```
+
+
+# 6. Calculation of module preservation in validation cohort
+
+```{r}
+setLabels;shortLabels
+lnames
+multiExpr_preservation = list(discovery = list(data = multiExpr[[1]]$data), validation = list(data = multiExpr[[2]]$data));
+multiColor = list(discovery = moduleColors_dis);
+
+
+system.time( {
+  mp = modulePreservation(multiExpr_preservation, multiColor,
+                          networkType = "unsigned",
+                          referenceNetworks = 1,
+                          nPermutations = 1000,
+                          maxModuleSize=1500,
+                          maxGoldModuleSize=500,
+                          randomSeed = 1,
+                          quickCor = 0,
+                          verbose = 3,
+                          parallelCalculation = T)
+} );
+# Save the results
+save(mp, file =  paste0(output,"RData/",study,"-modulePreservation.RData"))
+
+load(paste0(output,"RData/",study,"-modulePreservation.RData"))
+```
+
+# 7. Analysis and display of module preservation results
+
+```{r}
+discovery = 1
+validation = 2
+statsObs = cbind(mp$quality$observed[[discovery]][[validation]][, -1], mp$preservation$observed[[discovery]][[validation]][, -1])
+statsZ = cbind(mp$quality$Z[[discovery]][[validation]][, -1], mp$preservation$Z[[discovery]][[validation]][, -1]);
+
+
+# Compare preservation to quality:
+print( cbind(statsObs[, c("medianRank.pres", "medianRank.qual")],
+             signif(statsZ[, c("Zsummary.pres", "Zsummary.qual")], 2)) )
+
+
+
+# Module labels and module sizes are also contained in the results
+modColors = rownames(mp$preservation$observed[[discovery]][[validation]])
+moduleSizes = mp$preservation$Z[[discovery]][[validation]][, 1];
+
+# leave grey and gold modules out
+plotMods = !(modColors %in% c("grey", "gold"));
+# Text labels for points
+text = modColors[plotMods];
+
+plotMods = !(modColors %in% c(NA));
+text = modColors
+# Auxiliary convenience variable
+plotData = cbind(mp$preservation$observed[[discovery]][[validation]][, 2], mp$preservation$Z[[discovery]][[validation]][, 2])
+# Main titles for the plot
+mains = c("Preservation Median rank", "Preservation Zsummary");
+# Start the plot
+sizeGrWindow(10, 5);
+jpeg(file = paste0(output_figures,study,"-modulePreservation.jpeg"), wi = 12, he = 9,units = 'in', res = 480)
+par(mfrow = c(1,2),mar = c(4.5,4.5,2.5,1))
+for (p in 1:2)
+{
+  min = min(plotData[, p], na.rm = TRUE);
+  max = max(plotData[, p], na.rm = TRUE);
+  # Adjust ploting ranges appropriately
+  if (p==2)
+  {
+    if (min > -max/10) min = -max/10
+    ylim = c(min - 0.1 * (max-min), max + 0.1 * (max-min))
+  } else
+    ylim = c(max + 0.1 * (max-min), min - 0.1 * (max-min))
+  plot(moduleSizes[plotMods], plotData[plotMods, p], col = 1, bg = modColors[plotMods], pch = 21,
+       main = mains[p],
+       cex = 2.4,
+       ylab = mains[p], xlab = "Module size", log = "x",
+       ylim = ylim,
+       xlim = c(10, 2000), cex.lab = 1.2, cex.axis = 1.2, cex.main =1.4)
+  labelPoints(moduleSizes[plotMods], plotData[plotMods, p], text, cex = 1, offs =0.08 ,protectEdges =F);
+  # For Zsummary, add threshold lines
+  if (p==2)
+  {
+    abline(h=0)
+    abline(h=2, col = "blue", lty = 2)
+    abline(h=10, col = "darkgreen", lty = 2)
+  }
+}
+dev.off()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+

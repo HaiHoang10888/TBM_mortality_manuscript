@@ -1,0 +1,275 @@
+,---
+title: 'Mortatlity in TBM based baseline gene expression '
+author: "Haiht"
+date: '2023-03-31'
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+editor_options: 
+  chunk_output_type: console
+---
+
+# Set up R enviroment {.tabset .tabset-fade .tabset-pills}
+Set the random generator seed so we can reproduce exactly results without any stochasticity
+
+```{r setup, message=FALSE, warning=FALSE, echo= FALSE, results='hide'}
+knitr::opts_chunk$set(
+	fig.height = 6,
+	fig.width = 8,
+	message = FALSE,
+	warning = FALSE
+	)
+
+ # Set the random generator seed so we can reproduce exactly results without any stochasticity
+#rm(list=ls())
+set.seed(1235)
+# setwd("/home/ubuntu/tb_volume/Hai_Cpath_Analysis/Rstudio_sever/github_repos/Dexa_transcriptomics/")
+```
+
+
+```{r}
+library(ggplot2)
+library(WGCNA)
+library(Hmisc)
+library(dplyr)
+library(magrittr)
+library(stringr)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(AnnotationDbi)
+library(enrichplot)
+library(GOSemSim)
+library(ReactomePA)
+library(heatmaply)
+library(tidyverse)
+```
+
+# 1. Load input data
+
+```{r}
+getwd()
+source("../R_functions/WGCNA_CEMitool_Allfunctions_5May2022.R")
+source("../R_functions/functions_preservation_WGCNA_mortality_analysis.R")
+
+## set multi threads
+enableWGCNAThreads(nThreads=12)
+
+# Load the data saved in the first part
+output <- "WGCNA/All_study/Consensus_TBM/Discovery_validation_Dex_HIV/"
+study = "TBM_Death_281"
+lnames = load( paste0(output,"RData/",study,"-01-dataInput.RData"));
+# The variable lnames contains the names of loaded variables.
+lnames
+dim(multiExpr[[2]]$data)
+names(Traits[[1]]$data)
+
+# Load the results of network analysis, tutorial part 2.a
+lnames = load(file = paste0(output,"RData/",study_dis,"-02-networkConstruction-auto.RData"));
+lnames
+exprSize = checkSets(multiExpr);
+nSets = exprSize$nSets;
+
+## get order of modules in discovery
+moduleOrder <- unique(net_dis$colors) 
+names(moduleOrder) <- labels2colors(unique(net_dis$colors))
+index <- match(as.numeric(str_replace_all(names(MEs_dis),"ME","")),moduleOrder)
+moduleOrder <- paste0("ME",names(moduleOrder[index]))
+
+```
+
+
+```{r}
+library("cowplot")
+library(ggpubr)
+## function to get break poinr
+Get.breaks <- function(f, cuts, digits = 2)
+{
+  x <- round(quantile(f, probs = seq(1/cuts, 1 - 1/cuts, 1/cuts), names = F,na.rm=T), digits)
+  x <- sort(unique(c(0, x, Inf)))
+  rm(f, cuts, digits)
+  return(x)
+}
+
+# names(data_HIVpos)
+data_HIVpos <-rbind(Traits[[1]]$data,Traits[[2]]$data) %>%
+  subset(Study =="26TB")
+data_HIVneg <-rbind(Traits[[1]]$data,Traits[[2]]$data) %>%
+  subset(Study =="27TB")
+
+common_hub_selected <- read.csv(paste0(output,"general_output/Common_Hubgenes_raw.csv"))
+common_hub_selected %<>% filter(module %in% c("blue", "brown")) %>% 
+  dplyr::select(gene)
+specific_hub_selected <- read.csv("WGCNA/All_study/Consensus_TBM/General_DEX/general_output/Specific_consensus_hubgenes.csv") %>%
+  dplyr::select(gene)
+selected_genes <- unique(c(common_hub_selected$gene,specific_hub_selected$gene))
+
+Expr_All <- get(load(file="../General_analysis/RData/gene_clini_adjusted_ComBat_all.Rdata"))
+rownames(Expr_All) <- Expr_All$LIMS_ID
+clini_index <- 1:which(names(Expr_All)=="Run")
+# Expr_All = as.data.frame(Expr_All[, -c(clini_index)])
+cox_HIVpos <- Expr_All[rownames(data_HIVpos),selected_genes] %>% as.matrix()
+cox_HIVneg <- Expr_All[rownames(data_HIVneg),selected_genes] %>% as.matrix()
+```
+
+
+```{r}
+## for common genes
+d2 <- rbind(cbind(cox_HIVpos,data_HIVpos), cbind(cox_HIVneg,data_HIVneg))
+d2 %<>% filter(!(evdeath_3M == 0 & ttdeath < 97)) %>% 
+  mutate(cohort=ifelse(Study=="26TB","HIVpos","HIVneg")) %>%
+  dplyr::select(c("CD28","FCAR","MCEMP1","TRABD2A","PKD1","NELL2","IL1R2","ZNF354C","evdeath_3M","cohort"))
+# clini_var <- c("Study", "","evdeath","evdeath_3M")
+d2_long <- gather(d2, genes, concentration, "CD28","FCAR","MCEMP1","TRABD2A","PKD1","NELL2","IL1R2","ZNF354C",factor_key=TRUE)
+
+p<-list()
+genes_list <-as.character(unique(d2_long$genes))
+# i=1
+for(i in 1:length(genes_list)){
+  df <- d2_long %>% filter(genes==genes_list[i])
+  if(i%in%c(1:6)){
+    ylab<-"Mortality at three months"
+  }else{
+    ylab<-""
+  }
+  breaks<-Get.breaks(df$concentration, cuts = 15, digits = 4)
+  labels<-c(head(tail(breaks,-1),-1),mean(c(max(df$concentration,na.rm=T),head(tail(breaks,2),1))))
+  cut <- df %>%
+    mutate(genes_cut = cut(concentration, right = F
+                                 , breaks = breaks
+                                 , labels = labels),
+           concentration = as.numeric(as.character(genes_cut))) %>%
+    group_by(concentration,cohort) %>%
+    dplyr::summarise(.groups = "drop",
+              p_genes_cut = mean(evdeath_3M),
+              n_genes_cut=n()) %>%
+    mutate(se=sqrt(p_genes_cut*(1-p_genes_cut)/n_genes_cut)) %>%
+    mutate(plo=p_genes_cut-qnorm(.975,0,1)*se,
+           phi=p_genes_cut+qnorm(.975,0,1)*se,
+           concentration=ifelse(cohort=="HIVpos",concentration+0.05,concentration)) %>% as.data.frame()
+  p_tmp<-ggplot(data=cut,aes(x=concentration ,y=p_genes_cut,colour=cohort ))+
+    geom_point(size=2.5,alpha=0.5)+
+    geom_errorbar(aes(ymin=plo,ymax=phi,col=cohort),size=1,alpha=0.5)+
+    geom_smooth(method = glm,method.args = list(family = "binomial"), se = FALSE,size=2)+
+    scale_color_manual(values=c("#313695","#A50026"))+
+    theme_bw()+
+    labs(x = paste(genes_list[i]," Log2 normalized count "), y = ylab)+
+    theme_bw()+
+    theme(legend.position="bottom")+ 
+    theme(panel.grid.minor = element_blank(),
+          axis.title.x = element_text(face="bold", colour="black", size=12),
+          axis.title.y = element_text(face="bold", colour="black", size=20),
+          axis.text.y = element_text( colour="black", size=15),
+          axis.text.x = element_text( colour="black", size=15),
+          axis.ticks.x=element_blank(),
+          legend.text = element_text(size = 15),
+          legend.title = element_text( colour="black", size=15),
+          legend.key = element_rect(colour = NA),
+          strip.text=element_text(face = "bold",size=15))+
+    coord_cartesian(ylim=c(0,0.85))
+  xdens <- axis_canvas(p_tmp, axis = "x")+
+    geom_density(data=df,aes(x=concentration,fill=cohort),alpha=0.25)+
+    scale_fill_manual( values = c("#313695","#A50026"))
+  p1 <- insert_xaxis_grob(p_tmp, xdens, grid::unit(.2, "null"), position = "top")
+  p[[i]]<-ggdraw(p1)
+}
+
+gene_names <- c("CD28","FCAR","MCEMP1","TRABD2A","PKD1","NELL2","IL1R2","ZNF354C")
+
+for(i in 1:length(gene_names)) {
+  jpeg(file=paste0(output,"general_output/figures/Mortality/Mortality_rate_by_gene_",gene_names[i],".jpeg"),wi = 5, 
+     he = 5, units = "in",res=480)
+  print(p[[i]])
+  dev.off()
+}
+
+# ggarrange(plotlist = p, ncol = 2)
+# jpeg(file=paste0(output,"general_output/FigureS5_top_hit_genes_commonhub.jpeg"),wi = 10, 
+#      he = 8, units = "in",res=480)
+# ggarrange(plotlist = p, nrow = 2,ncol = 2)
+# dev.off()
+```
+
+
+```{r}
+
+## for specific genes
+d2 <- rbind(cbind(cox_HIVpos,data_HIVpos), cbind(cox_HIVneg,data_HIVneg))
+d2 %<>% filter(!(evdeath_3M == 0 & ttdeath < 97)) %>% 
+  mutate(cohort=ifelse(Study=="26TB","HIVpos","HIVneg")) %>%
+  dplyr::select(c("RNF24","ZNF354C","PKD1","PPRC1","evdeath_3M","cohort"))
+# clini_var <- c("Study", "","evdeath","evdeath_3M")
+d2_long <- gather(d2, genes, concentration,"RNF24","ZNF354C","PKD1","PPRC1",factor_key=TRUE)
+
+
+p<-list()
+genes_list <-as.character(unique(d2_long$genes))
+for(i in 1:length(genes_list)){
+  df <- d2_long %>% filter(genes==genes_list[i])
+  if(i%in%c(1,2,3,4)){
+    ylab<-"Mortality at three months"
+  }else{
+    ylab<-""
+  }
+  breaks<-Get.breaks(df$concentration, cuts = 15, digits = 4)
+  labels<-c(head(tail(breaks,-1),-1),mean(c(max(df$concentration,na.rm=T),head(tail(breaks,2),1))))
+  cut <- df %>%
+    mutate(genes_cut = cut(concentration, right = F
+                           , breaks = breaks
+                           , labels = labels),
+           concentration = as.numeric(as.character(genes_cut))) %>%
+    group_by(concentration,cohort) %>%
+    dplyr::summarise(.groups = "drop",
+              p_genes_cut = mean(evdeath_3M),
+              n_genes_cut=n()) %>%
+    mutate(se=sqrt(p_genes_cut*(1-p_genes_cut)/n_genes_cut)) %>%
+    mutate(plo=p_genes_cut-qnorm(.975,0,1)*se,
+           phi=p_genes_cut+qnorm(.975,0,1)*se,
+           concentration=ifelse(cohort=="HIVpos",concentration+0.05,concentration)) %>% as.data.frame()
+  p_tmp<-ggplot(data=cut,aes(x=concentration ,y=p_genes_cut,colour=cohort ))+
+    geom_point(size=2.5,alpha=0.5)+
+    geom_errorbar(aes(ymin=plo,ymax=phi,col=cohort),size=1,alpha=0.5)+
+    geom_smooth(method = glm,method.args = list(family = "binomial"), se = FALSE,size=2)+
+    scale_color_manual(values=c("#313695","#A50026"))+
+    theme_bw()+
+    labs(x = paste(genes_list[i]," Log2 normalized count "), y = ylab)+
+    theme_bw()+
+    theme(legend.position="bottom")+ 
+    theme(panel.grid.minor = element_blank(),
+          axis.title.x = element_text(face="bold", colour="black", size=12),
+          axis.title.y = element_text(face="bold", colour="black", size=20),
+          axis.text.y = element_text( colour="black", size=15),
+          axis.text.x = element_text( colour="black", size=15),
+          axis.ticks.x=element_blank(),
+          legend.text = element_text(size = 15),
+          legend.title = element_text( colour="black", size=15),
+          legend.key = element_rect(colour = NA),
+          strip.text=element_text(face = "bold",size=15))+
+    coord_cartesian(ylim=c(0,0.85))
+  xdens <- axis_canvas(p_tmp, axis = "x")+
+    geom_density(data=df,aes(x=concentration,fill=cohort),alpha=0.25)+
+    scale_fill_manual( values = c("#313695","#A50026"))
+  p1 <- insert_xaxis_grob(p_tmp, xdens, grid::unit(.2, "null"), position = "top")
+  p[[i]]<-ggdraw(p1)
+}
+
+gene_names <- c("RNF24","ZNF354C","PKD1","PPRC1")
+
+for(i in 1:4) {
+  jpeg(file=paste0(output,"general_output/Mortality_rate_by_gene_",gene_names[i],".jpeg"),wi = 5, 
+     he = 5, units = "in",res=480)
+  print(p[[i]])
+  dev.off()
+}
+
+# ggarrange(plotlist = p, ncol = 2)
+# p1<-cowplot::plot_grid(plotlist = p[[1:2]], ncol = 2)
+# jpeg(file=paste0(output,"general_output/FigureS5_top_hit_genes_Specific_hub.jpeg"),wi = 10, 
+#      he = 8, units = "in",res=480)
+# ggarrange(plotlist = p, nrow = 2,ncol = 2)
+# dev.off()
+```
+

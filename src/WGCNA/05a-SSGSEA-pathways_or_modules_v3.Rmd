@@ -1,0 +1,2189 @@
+---
+title: 'Mortatlity in TBM based baseline gene expression '
+author: "Haiht"
+date: '2023-03-31'
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+editor_options: 
+  chunk_output_type: console
+---
+
+# Set up R enviroment {.tabset .tabset-fade .tabset-pills}
+Set the random generator seed so we can reproduce exactly results without any stochasticity
+
+```{r setup, message=FALSE, warning=FALSE, echo= FALSE, results='hide'}
+knitr::opts_chunk$set(
+	fig.height = 6,
+	fig.width = 8,
+	message = FALSE,
+	warning = FALSE
+	)
+
+ # Set the random generator seed so we can reproduce exactly results without any stochasticity
+#rm(list=ls())
+set.seed(1235)
+```
+
+
+```{r}
+library(ggplot2)
+library(WGCNA)
+library(Hmisc)
+library(dplyr)
+library(magrittr)
+library(stringr)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(AnnotationDbi)
+library(enrichplot)
+library(GOSemSim)
+library(ReactomePA)
+library(heatmaply)
+library(qusage)
+library(GSVA)
+library(sjmisc)
+library(ggpubr)
+library(pathview)
+library(gtsummary)
+```
+
+
+```{r}
+library(doParallel)
+library(foreach)
+library(gglasso)
+library(doSNOW)
+## registry cores to cluster
+cl <- makeCluster(10,type='SOCK')
+#registerDoParallel(cl)
+registerDoSNOW(cl)
+library(BiocParallel)
+```
+
+# Function
+```{r}
+# qs.results1
+
+
+Plot_CI_Quasage <- function(qs.results1,qs.results2,lowerBound=0.025,upperBound=1-lowerBound,
+                            col1="red", col2="blue", ylim=NULL,xlim=NULL, xlab=NULL,
+                            ylab=NULL,main=NULL, type="p", x.labels=NULL,
+                            mar= c(4,20,4,0),cex.axis=1.5, cex.lab=1.5,
+                            shift=0.5){
+  ###get values from QSarray
+QSarray <- qs.results1
+path.index=1:numPathways(QSarray)
+# names(QSarray$pathways)
+means = QSarray$path.mean[path.index]
+ord=1:length(means)
+CIs = calcBayesCI(qs.results1,low=lowerBound,up=upperBound)[,path.index, drop=FALSE]
+CIs2 = calcBayesCI(qs.results2,low=lowerBound,up=upperBound)[,path.index, drop=FALSE]
+
+##x labels
+if(is.null(x.labels)){
+  x.labels=str_replace_all(names(means),"_"," ")
+}
+  
+if(is.null(xlab)){xlab="Pathway fold change enrichment"}
+if(is.null(ylab)){ylab=""}
+# dev.off()
+##make plotting region
+Oldcex=par('cex')
+# mar= c(4,18,4,0)
+par( mar= mar) 
+if(is.null(xlim)){xlim = range(c(CIs,CIs2),na.rm=T)}
+##plot data
+y_df = seq(1,length(ord)*2,2)
+plot(x=means[ord],y=y_df,type="n",las=1, xlim=xlim,
+     axes=FALSE,ylab=ylab,xlab=substitute(paste(bold(xlab))),
+     main=main,cex.lab=cex.lab,
+     cex.axis=cex.axis)
+    ##add guiding lines
+addGrid=F
+if(addGrid){abline(h=y_df,col=gray(seq(0.5,1,length.out=10)),lty=2)}
+##add axes
+axis(1,las=1,cex.axis=cex.axis)
+par(cex=cex.lab)
+#         axis(1, at=ord,las=2, labels=x.labels,...)
+axis(2, at=y_df,las=1, labels=rep("",length(ord)))
+#Ys<-par("usr")[1] -  par()$cxy[2]*par()$mgp[2]
+text(min(xlim) - 0.05,y_df,  adj = 1, labels = x.labels[ord], xpd = TRUE)
+# par(cex=Oldcex)
+abline(v=0,lty=2)
+
+arrows(CIs[1,ord],y_df, CIs[2,ord],y_df,
+      code=3,length=0.1,angle=90, col="red", lwd=2)
+points(means[ord],y_df,type=type,col="black")
+
+## add second layer
+QSarray <- qs.results2
+path.index=1:numPathways(QSarray)
+means = QSarray$path.mean[path.index]
+ord=1:length(means)
+CIs = calcBayesCI(QSarray,low=lowerBound,up=upperBound)[,path.index, drop=FALSE]
+arrows(CIs[1,ord],y_df +shift, CIs[2,ord],y_df +shift,
+      code=3,length=0.1,angle=90, col="blue", lwd=2)
+points(means[ord],y_df + shift,type=type,col="black")
+  
+}
+```
+
+
+# 1. Load input data
+```{r}
+output <- "WGCNA/All_study/Consensus_TBM/Discovery_validation_Dex_HIV/"
+study = "TBM_Death_281"
+study_dis = "TBM_Death_discovery"
+study_val = "TBM_Death_validation"
+source("../R_functions/WGCNA_CEMitool_Allfunctions_5May2022.R")
+source("../R_functions/functions_preservation_WGCNA_mortality_analysis.R")
+source("../R_functions/Function_data_process_and_analysis_8MAR2021.R")
+
+study = "TBM_Death_281"
+
+anno <- "../count_expression/raw_data/GeneAnnotationFile_EnsembltoGeneIds.txt"
+anno <- read.table(anno,header = T)
+
+anno_rRNA <- anno[which(anno$class %in% c("rRNA_pseudogene", "rRNA")),]
+globin_genes <- c("HBA1","HBA2", "HBB", "HBD", "HBE1", "HBG1", "HBG2", "HBM", "HBQ1", "HBZ", "MB")
+anno_globin <- anno[which(anno$gene_symbol %in% globin_genes),]
+Exlcuded_rRNA <- c(as.character(anno_globin$gene_symbol),
+                   as.character(anno_rRNA$gene_symbol))
+
+# subset for genes in chromosome X or Y (n = 2946)
+anno_sex_chr_gene <- anno[which(anno$chr =="Y"|anno$chr =="X"),]
+Exlcuded_sex <- as.character(anno_sex_chr_gene$gene_symbol)
+
+# The following setting is important, do not omit.
+options(stringsAsFactors = FALSE)
+```
+
+```{r}
+## Load clinical infor
+## import baseline data for 26TB and 27Tb
+load("../clinical_data/process_data/Baseline_26TB_27TB.RData")
+Baseline_26TB_27TB %<>% filter(!(is.na(LIMS_ID)|LIMS_ID=="NA")) %>%
+  mutate(LTA4H.rs=ifelse(LTA4H=="CT","TC",LTA4H)) %>% 
+  dplyr::select(USUBJID,DIAGNOSTIC_SCORE,LTA4H.rs,SEX,AGE,TBMGRADE,ttdeath,evdeath,WBC,NEUTLE,LYMLE,CSFWBC,CSFLYMTOT,PROTEIN,History_TBT,FOCAL_Neuro)
+
+library(readxl)
+#load RNAseq infor
+All_sample_RNAseq <- read_excel("../General_analysis/Infor/All_sample_RNAseq.xlsx",sheet = "Run1and2") %>% 
+  as.data.frame() %>%
+  mutate (Study=ifelse(Study=="HV","43TB",Study))
+rownames(All_sample_RNAseq) <- All_sample_RNAseq$LIMS_ID
+
+## filter for 26 and 27TB
+All_sample_infor <- All_sample_RNAseq %>%
+  mutate(USUBJID = substring(ID_code,5,length(ID_code))) %>%
+  dplyr::select(LIMS_ID,USUBJID, Study,timepoint,Run,RNA_RIN) %>%
+  subset(Study %in% c("43TB","29TB","28TB", "27TB", "26TB"))
+
+table(All_sample_infor$Study)
+dim(All_sample_infor)
+names(Baseline_26TB_27TB)
+evdays=97
+traitData = All_sample_infor %>%
+  merge(.,Baseline_26TB_27TB, by="USUBJID",all.x=T) %>%
+  mutate(ttdeath = as.numeric(ttdeath),
+         Study=factor(Study),
+         group=factor(Study, levels = c("43TB","29TB","28TB", "27TB", "26TB"),
+                      labels = c("Healthy","PTB","PTB", "TBM", "TBM")),
+         evdeath_3M = ifelse(ttdeath > evdays,0,evdeath),
+         status= ifelse(is.na(evdeath_3M),"NA",evdeath_3M),
+         status1 = factor(status, levels = c("1","0","NA"), labels = c("Yes", "No","NA")),
+         status2 = paste0(status1,Study),
+         Groups= factor(status2, levels = c("NA43TB","NA28TB", "NA29TB", "No27TB","No26TB", "Yes27TB", "Yes26TB"),
+                       labels = c("Healthy","PTB", "PTB", "TBM-S","TBM-S", "TBM-D", "TBM-D")),
+         group_qusage= factor(status2, levels = c("NA43TB","NA28TB", "NA29TB", "No27TB","No26TB", "Yes27TB", "Yes26TB"),
+                       labels = c("Healthy","PTB", "PTB", "HIVneg_S","HIVpos_S", "HIVneg_D", "HIVpos_D")),
+         group_HIV= factor(status2, levels = c("NA43TB","NA28TB", "NA29TB", "No27TB","No26TB", "Yes27TB", "Yes26TB"),
+                       labels = c("Healthy","PTB", "PTB", "HIVneg-TBM","HIVpos-TBM", "HIVneg-TBM", "HIVpos-TBM")))
+rownames(traitData) <- traitData$LIMS_ID
+```
+
+
+```{r}
+#Read in the expression data set
+Data <- get(load(file="../General_analysis/RData/count_data_adjusted_ComBat.Rdata"))
+rownames(Data) <- Data$LIMS_ID
+
+# Take a quick look at what is in the data set:
+dim(Data);
+head(names(Data))
+tail(names(Data))
+rownames(traitData)
+## remove rRNA and HB genes, genes unstable due to method of library preparation
+rRNA_index <- which(colnames(Data) %in% Exlcuded_rRNA)
+sex_index <- which(colnames(Data) %in% Exlcuded_sex) ## may consider to remove sex related genes
+datExpr = as.data.frame(Data[rownames(traitData), -c(rRNA_index)]) %>%
+  dplyr::select(-LIMS_ID);
+#"TNF" %in% colnames(datExpr)
+GSVA_Expr <- t(as.matrix(datExpr))
+
+dim(traitData)
+qusage_traitData = traitData %>% subset(timepoint=="D0")
+qusage_Expr <- as.data.frame(Data[rownames(qusage_traitData), -c(rRNA_index)]) %>%
+  dplyr::select(-LIMS_ID) %>%
+  t()
+dim(qusage_Expr)
+
+## Trait data to perform qusage
+qusage_traitData %<>% mutate(status=status1)
+dim(qusage_traitData)
+```
+
+# Review pathway 
+```{r}
+## GO 
+GOBP <- read.gmt("Pathway_database/GO_Biological_Process_2021.gmt")
+GOBP_name <- names(GOBP)
+rename_GO <- function(x){
+  as.character(strsplit(x,split=" (GO:",fixed=TRUE)[[1]][1])
+}
+names(GOBP) <- as.character(lapply(GOBP_name,rename_GO))
+
+## Reactome 
+Reactome <- read.gmt("Pathway_database/Reactome_2022.gmt")
+Reactome_name <- names(Reactome)
+rename_Reactome <- function(x){
+  as.character(strsplit(x,split=" R-HSA-",fixed=TRUE)[[1]][1])
+}
+names(Reactome) <- as.character(lapply(Reactome_name,rename_Reactome))
+Inflammasomes <- Reactome[["Inflammasomes"]]
+Icosanoid <- get_genelist_pathway(name="icosanoid metabolic process")
+Inflammatory_repsponse <- unname(unlist(GOBP["inflammatory response"]))
+Cytokine_signaling_in_immune_system <- Reactome[["Cytokine Signaling In Immune System"]]
+interferon_mediated_signaling_pathway <-
+  get_genelist_pathway(name="interferon-mediated signaling pathway")
+TNF_signaling <-  get_genelist_pathway_kegg(hsa_ID = "hsa04668")
+
+```
+
+
+```{r}
+length(TNF_signaling)
+
+length(which(TNF_signaling %in% colnames(Data)))
+
+```
+
+## GS
+
+```{r}
+gs <- list("Inflammatory_repsponse"=Inflammatory_repsponse
+           ,"Inflammasomes"=Inflammasomes,
+           "Cytokine_signaling" = Cytokine_signaling_in_immune_system,
+           "Icosanoid" = Icosanoid,
+           "Interferon"=interferon_mediated_signaling_pathway,
+           "TNF_signaling"=TNF_signaling)
+
+length(Inflammatory_repsponse)
+```
+
+## SSGSEA
+
+```{r}
+#GSVA_N <- t(gsva(count_N, modules, mx.diff=T,method="GSVA",kcdf = "Gaussian",abs.ranking=F)) 
+GSVA <- t(gsva(GSVA_Expr, gs,method="ssgsea",mx.diff=T,BPPARAM=MulticoreParam(12)))
+colnames(GSVA)
+## merge GSVA data with traidata
+df<- NULL
+if (all(rownames(GSVA) == rownames(traitData))) {
+  df <- cbind(traitData,GSVA)
+}
+
+if (all(rownames(df) == rownames(datExpr))) {
+  df <- data.frame(df,TNF=datExpr$TNF,IL1B=datExpr$IL1B,
+                   IL10=datExpr$IL10,
+                   IFNg=datExpr$IFNG)
+}
+
+dim(df)
+df %<>% subset(timepoint=="D0")
+colnames(df)
+```
+
+### Plot for Pathway in all Study
+
+```{r}
+i=0
+for (gene in c(names(gs))) {
+  i = i + 1
+  print(paste0(i,". ",gene))
+  # data to plot 
+  df_plot <- df %>%
+    dplyr::select(all_of(gene),group_HIV,Groups)
+  colnames(df_plot)[1:3] <- c("gene", "Study", "Groups")
+  title <- str_replace_all(gene,"_", " ")
+  P <- ggplot(df_plot, aes(x = Study, y = gene)) +
+    geom_boxplot(size=1,position=position_dodge(1),width=0.7,
+                 fill="white",outlier.colour="red",
+                 outlier.shape=NA,outlier.size=3)+
+    geom_jitter(aes(color=Study,fill=Study),width=0.2,size=2,alpha = 0.5)+
+    scale_color_manual(values=c("#252525","#00441b","#3182bd","#de2d26"))+
+    theme_bw()+
+    labs(x="",y = "Enrichment Score", title = title)+
+    theme(plot.title = element_text(size = 25),
+          legend.text = element_text(size = 20) ,
+          #legend.position="bottom",
+          legend.title = element_text(size = 20,color="black",face="bold"),
+          axis.text = element_text(size = 25),
+          axis.text.x=element_text(color="black",size=13,face="bold"),
+          axis.title.x = element_text(size = 20,color="black",face="bold"),
+          axis.text.y=element_text(color="black",size=20),
+          axis.title.y = element_text(size = 20,color="black",face="bold"),
+          axis.title= element_text(size = 40,color="black",face="bold"))+
+    scale_x_discrete("",labels = c("Healthy" = "Healthy \n Controls",
+                                   "PTB" = "PTB",
+                                   "HIVneg-TBM"="HIVneg\nTBM",
+                                   "HIVpos-TBM"="HIVpos\nTBM"))
+  jpeg(file =  paste0(output,"general_output/ssgsea/",gene,"_boxplot.jpeg"), wi = 7.3, 
+       he = 6, units = "in",res=480)
+  print(P)
+  dev.off()
+}
+```
+
+
+### Plot for Pathway in TBM
+```{r}
+i=0
+gene = "Cytokine_signaling"
+target <- "TNF"
+for (gene in c(names(gs))) {
+  i = i + 1
+  print(paste0(i,". ",gene))
+  ## calculate wilcox 27TB
+  df_test <- df %>% dplyr::select(all_of(gene))
+  colnames(df_test)[1] <- "gene"
+  df_test1 <- df %>%
+    subset(Study=="27TB") %>%
+    dplyr::select(all_of(gene),status) %>%
+    mutate(status=factor(status))
+  colnames(df_test1)[1] <- "gene"
+  test <- df_test1 %>%
+    tbl_summary(by = status) %>%
+    add_p()
+  pval1 <- test$table_body$p.value
+  sig1 = as.character(gtools::stars.pval(pval1))
+  size_sig1 = 15
+
+  df_test2 <- df %>%
+    subset(Study=="26TB") %>%
+    dplyr::select(all_of(gene),status) %>%
+    mutate(status=factor(status))
+  colnames(df_test2)[1] <- "gene"
+  test <- df_test2 %>%
+    tbl_summary(by = status) %>%
+    add_p()
+  pval2 <- test$table_body$p.value
+  sig2 <- as.character(gtools::stars.pval(pval2))
+  size_sig2 = 15
+
+  label.df1 <- data.frame(group_HIV = c("HIVneg-TBM"),
+                          gene = max(c(df_test1$gene,df_test2$gene))+ 0.01)
+  label.df2 <- data.frame(group_HIV = c("HIVpos-TBM"),
+                          gene = max(c(df_test1$gene,df_test2$gene))+ 0.01)
+  if (gene %in% target) {
+    label.df1 <- data.frame(group_HIV = c("HIVneg-TBM"),
+                          gene = max(c(df_test1$gene,df_test2$gene))+ 1)
+    label.df2 <- data.frame(group_HIV = c("HIVpos-TBM"),
+                          gene = max(c(df_test1$gene,df_test2$gene))+ 1)
+  }
+  
+  # data to plot 
+  df_plot <- df %>%
+    filter(Study %in% c("26TB", "27TB")) %>%
+    dplyr::select(all_of(gene),group_qusage) %>%
+    mutate(group_qusage =factor(group_qusage,
+                                levels=c("HIVneg_S","HIVneg_D","HIVpos_S","HIVpos_D")))
+  colnames(df_plot) <- c("gene", "Groups")
+  title <- str_replace_all(gene,"_", " ")
+  P <- ggplot(df_plot, aes(x = Groups, y = gene)) +
+    geom_boxplot(size=1,position=position_dodge(1),width=0.7,
+                 fill="white",outlier.colour="red",
+                 outlier.shape=NA,outlier.size=3)+
+    geom_jitter(aes(color=Groups,fill=Groups),width=0.2,size=2,alpha = 0.5)+
+    scale_color_manual(values=c("#3182bd","dodgerblue4","#de2d26","red4"))+
+    theme_bw()+
+    labs(x="",y = "Enrichment score", title = title)+#,subtitle = ""
+    theme(plot.title = element_text(size = 25),
+          legend.text = element_text(size = 20) ,
+          #legend.position="bottom",
+          legend.title = element_text(size = 20,color="black",face="bold"),
+          axis.text = element_text(size = 25),
+          axis.text.x=element_text(color="black",size=13,face="bold"),
+          axis.title.x = element_text(size = 20,color="black",face="bold"),
+          axis.text.y=element_text(color="black",size=20),
+          axis.title.y = element_text(size = 20,color="black",face="bold"),
+          axis.title= element_text(size = 40,color="black",face="bold"))+
+    scale_x_discrete("",labels = c("HIVneg_S" = "HIVneg \n S",
+                                   "HIVneg_D" = "HIVneg \n D",
+                                   "HIVpos_S" = "HIVpos \n S",
+                                   "HIVpos_D" = "HIVpos \n D"))
+  if(pval1 < 0.03) {
+    P <- P +  geom_text(data = label.df1, aes(x=1.5, y=gene), label = sig1, size=size_sig1) +
+      annotate("rect", xmin = 1, xmax = 2, ymin = label.df1$gene,
+                  ymax =label.df1$gene + 0.001, alpha=1,colour = "black") +
+      annotate("rect", xmin = 1, xmax = 1 + 0.01, ymin = label.df1$gene -0.002,
+                  ymax =label.df1$gene, alpha=1,colour = "black") +
+      annotate("rect", xmin = 2 - 0.01, xmax = 2, ymin = label.df1$gene - 0.002,
+                  ymax =label.df1$gene, alpha=1,colour = "black")
+  }
+  
+  if(pval2 < 0.03) {
+    P <- P +  geom_text(data = label.df2, aes(x=3.5, y=gene), label = sig2, size=size_sig2) +
+      annotate("rect", xmin = 3, xmax = 4, ymin = label.df2$gene,
+                  ymax =label.df2$gene + 0.001, alpha=1,colour = "black") +
+      annotate("rect", xmin = 3, xmax = 3 + 0.01, ymin = label.df2$gene -0.002,
+                  ymax =label.df2$gene, alpha=1,colour = "black") +
+      annotate("rect", xmin = 4 - 0.01, xmax = 4, ymin = label.df2$gene - 0.002,
+                  ymax =label.df2$gene, alpha=1,colour = "black")
+  }
+  
+  jpeg(file =  paste0(output,"general_output/ssgsea/TBM/",gene,"_boxplot_TBM.jpeg"), wi = 7.3, he = 6, units = "in",res=480)
+  print(P)
+  dev.off()
+}
+
+```
+
+### GT summary and P for pairwise comparison
+```{r}
+library(gtsummary)
+library("YesSiR")
+library(officer)
+# set theme to get Median (IQR) by default in `tbl_summary()`
+#theme_gtsummary_mean_sd()
+theme_gtsummary_continuous2()
+
+# function to add pairwise copmarisons to `tbl_summary()`
+add_stat_pairwise <- function(data, variable, by, ...) {
+  # calculate pairwise p-values
+  #pw <- pairwise.t.test(data[[variable]], data[[by]], p.adj = "none")
+  pw <- pairwise.wilcox.test(data[[variable]], data[[by]], p.adj = "none")
+
+  # convert p-values to list
+  index <- 0L
+  p.value.list <- list()
+  for (i in seq_len(nrow(pw$p.value))) {
+    for (j in seq_len(nrow(pw$p.value))) {
+      index <- index + 1L
+      
+      p.value.list[[index]] <- 
+        c(pw$p.value[i, j]) %>%
+        setNames(glue::glue("**{colnames(pw$p.value)[j]} vs. {rownames(pw$p.value)[i]}**"))
+    }
+  }
+  
+  # convert list to data frame
+  p.value.list %>% 
+    unlist() %>%
+    purrr::discard(is.na) %>%
+    t() %>%
+    as.data.frame() %>%
+    # formatting/roundign p-values
+    dplyr::mutate(dplyr::across(everything(), style_pvalue))
+}
+
+dim(df)
+names(df)
+table(df$group)
+
+digits_list <- list(Inflammatory_repsponse~3,
+                    Inflammasomes~3,
+                    Cytokine_signaling~3,
+                    Icosanoid~3,
+                    Interferon~3,
+                    TNF_signaling~3)
+df %>%
+  dplyr::select(all_of(c(names(gs),"group"))) %>%
+  tbl_summary(by = group, missing = "no",
+              statistic=list(all_continuous() ~ "{median} ({p25}, {p75})"),
+              digits=digits_list) %>%
+  # add pariwaise p-values
+  add_stat(everything() ~ add_stat_pairwise) %>%
+  as_flex_table() %>% exportxlsx(path =paste0(output,                                                              "general_output/Descriptive_literate_review_pathway_3groups.xlsx"))
+
+df %>%
+  dplyr::select(all_of(c(names(gs),"group_HIV"))) %>%
+  tbl_summary(by = group_HIV, missing = "no",
+              statistic=list(all_continuous() ~ "{median} ({p25}, {p75})"),
+              digits=digits_list) %>%
+  # add pariwaise p-values
+  add_stat(everything() ~ add_stat_pairwise) %>%
+  as_flex_table() %>% exportxlsx(path =paste0(output,                                                              "general_output/Descriptive_literate_review_pathway.xlsx"))
+
+```
+
+### Create exell file for source of pathway and genes list
+
+```{r}
+Neutrophil_activation_in_immune <- unname(unlist(GOBP["neutrophil activation involved in immune response"]))
+Acute_inflammatory_response <- get_genelist_pathway(name="acute inflammatory response")
+T_cell_activation <- get_genelist_pathway(name="T cell activation")
+Adaptive_immune_response <- get_genelist_pathway(name="adaptive immune response")
+T_cell_receptor_signaling_pathway <- get_genelist_pathway_kegg(hsa_ID = "hsa04660")
+B_cell_receptor_signaling_pathway_KEGG <- get_genelist_pathway_kegg(hsa_ID = "hsa04662")
+
+## function to create data frame
+create_df_source_pw <- function(V,pw_name,Database, Source, ID) {
+  df <- data.frame(Gene_symbol=V,
+                   Pathway=rep(pw_name, length(V)),
+                   Database=rep(Database, length(V)),
+                   ID=rep(ID, length(V)),
+                   Source=rep(Source, length(V)))
+}
+
+Neutro_df <- create_df_source_pw(V =Neutrophil_activation_in_immune, 
+                                 pw_name ="Neutrophil activation in immune",
+                                 Database="BP GO 2021",
+                                 ID="GO:0002283",
+                                 Source="https://maayanlab.cloud/Enrichr/#libraries")
+Acute_inflam_df <- create_df_source_pw(V =Acute_inflammatory_response, 
+                                 pw_name ="Acute inflammatory response",
+                                 Database="GO",
+                                 ID="GO:0002526",
+                                 Source="org.Hs.eg.db V3.17.0")
+T_cell_df <- create_df_source_pw(V =T_cell_activation, 
+                                 pw_name ="T cell activation",
+                                 Database="GO",
+                                 ID="GO:0042110",
+                                 Source="org.Hs.eg.db V3.17.0")
+Adaptive_df <- create_df_source_pw(V =Adaptive_immune_response, 
+                                 pw_name ="Adaptive immune response",
+                                 Database="GO",
+                                 ID="GO:0002250",
+                                 Source="org.Hs.eg.db V.3.17.0")
+TCR_df <- create_df_source_pw(V =T_cell_receptor_signaling_pathway, 
+                                 pw_name ="T cell receptor signaling",
+                                 Database="KEGG",
+                                 ID="hsa04660",
+                                 Source="KEGGREST V.1.40.0")
+
+BCR_df <- create_df_source_pw(V =B_cell_receptor_signaling_pathway_KEGG, 
+                                 pw_name ="B cell receptor signaling",
+                                 Database="KEGG",
+                                 ID="hsa04662",
+                                 Source="KEGGREST V.1.40.0")
+TNF_df <-  create_df_source_pw(V =TNF_signaling, 
+                                 pw_name ="TNF signaling",
+                                 Database="KEGG",
+                                 ID="hsa04668",
+                                 Source="KEGGREST V.1.40.0")
+
+Inflammasomes_df <- create_df_source_pw(V =Inflammasomes, 
+                                 pw_name ="Inflammasomes",
+                                 Database="Reactome 2022",
+                                 ID="R-HSA-622312",
+                                 Source="https://maayanlab.cloud/Enrichr/#libraries")
+
+Icosanoid_df <- create_df_source_pw(V =Icosanoid, 
+                                 pw_name ="Icosanoid metabolic process",
+                                 Database="GO",
+                                 ID="GO:0140888",
+                                 Source="org.Hs.eg.db V.3.17.0")
+Interferon_df <- create_df_source_pw(V =interferon_mediated_signaling_pathway, 
+                                 pw_name ="Interferon mediated signaling pathway",
+                                 Database="GO",
+                                 ID="GO:0006690",
+                                 Source="org.Hs.eg.db V.3.17.0")
+
+Inflammatory_df <- create_df_source_pw(V =Inflammatory_repsponse, 
+                                 pw_name ="Inflammatory repsponse",
+                                 Database="BP GO 2021",
+                                 ID="GO:0006954",
+                                 Source="https://maayanlab.cloud/Enrichr/#libraries")
+Cytokine_df <- create_df_source_pw(V =Cytokine_signaling_in_immune_system, 
+                                 pw_name ="Cytokine signaling in immune system",
+                                 Database="Reactome 2022",
+                                 ID="R-HSA-1280215",
+                                 Source="https://maayanlab.cloud/Enrichr/#libraries")
+Patwhay_source <- Reduce(rbind, list(Inflammatory_df,Cytokine_df,Interferon_df,
+                                     TNF_df,Icosanoid_df,Inflammasomes_df,
+                                     Neutro_df,Acute_inflam_df,Adaptive_df,TCR_df,BCR_df))
+write.csv(Patwhay_source, paste0(output,"general_output/Patwhay_source_supplement_file.csv"))
+
+## merge all data and export excell file
+
+
+packageVersion("KEGGREST")
+
+```
+
+# 2. Blue module
+## GO
+
+```{r}
+## read gmt file and then subset for interested pathway 
+## G0
+GOBP <- read.gmt("Pathway_database/GO_Biological_Process_2021.gmt")
+
+GOBP_name <- names(GOBP)
+rename_GO <- function(x){
+  as.character(strsplit(x,split=" (GO:",fixed=TRUE)[[1]][1])
+}
+names(GOBP) <- as.character(lapply(GOBP_name,rename_GO))
+
+## Blue GO
+
+Neutrophil_activation_in_immune <- unname(unlist(GOBP["neutrophil activation involved in immune response"]))
+Reg_of_inflammatory_response <- unname(unlist(GOBP["regulation of inflammatory response"]))
+#Response_to_bacterium <- unname(unlist(GOBP["response to bacterium"]))
+Response_to_bacterium <- get_genelist_pathway(name="response to bacterium")
+
+#Acute_inflammatory_response <- unname(unlist(GOBP["acute inflammatory response"]))
+Acute_inflammatory_response <- get_genelist_pathway(name="acute inflammatory response")
+
+#Pos_reg_of_response_to_external_stimulus  <- unname(unlist(GOBP["positive regulation of response to external stimulus"]))
+Pos_reg_of_response_to_external_stimulus <- get_genelist_pathway(name="positive regulation of response to external stimulus")
+
+#Pos_reg_of_cytokine_production <- unname(unlist(GOBP["positive regulation of cytokine production"]))
+Pos_reg_of_cytokine_production <- get_genelist_pathway(name="positive regulation of cytokine production")
+
+```
+
+
+## KEGG
+
+```{r}
+Cytokine_cytokine_receptor_interaction <- get_genelist_pathway_kegg(hsa_ID = "hsa04060")
+TLR_signaling <-  get_genelist_pathway_kegg(hsa_ID = "hsa04620")
+TNF_signaling <-  get_genelist_pathway_kegg(hsa_ID = "hsa04668")
+Osteoclast_differentiation <- get_genelist_pathway_kegg(hsa_ID ="hsa04380")  
+NFkappaB_signaling_pathway <- get_genelist_pathway_kegg(hsa_ID = "hsa04064")
+Th17_cell_differentiation <- get_genelist_pathway_kegg(hsa_ID = "hsa04659")
+Lipid_and_atherosclerosis <- get_genelist_pathway_kegg(hsa_ID = "hsa05417")
+Neutrophil_extracellular_Trap_formation <-  get_genelist_pathway_kegg(hsa_ID = "hsa04613")
+```
+
+## GS
+
+```{r}
+gs <- list("Neutrophil_activation_in_immune_respone"=Neutrophil_activation_in_immune,
+           "Reg_of_inflammatory_response" = Reg_of_inflammatory_response,
+           "Response_to_bacterium" = Response_to_bacterium,
+           "Acute_inflammatory_response"= Acute_inflammatory_response,
+           "Pos_reg_of_response_to_external_stimulus"= Pos_reg_of_response_to_external_stimulus,
+           "Pos_reg_of_cytokine_production" = Pos_reg_of_cytokine_production,
+           "Cytokine_cytokine_receptor_interaction" = Cytokine_cytokine_receptor_interaction,
+           "TLR_signaling" = TLR_signaling,
+           "TNF_signaling" = TNF_signaling,
+           "Osteoclast_differentiation" = Osteoclast_differentiation,
+           "NFkappaB_signaling_pathway" = NFkappaB_signaling_pathway,
+           "Th17_cell_differentiation" = Th17_cell_differentiation,
+           "Lipid_and_atherosclerosis" = Lipid_and_atherosclerosis,
+           "Neutrophil_extracellular_Trap_formation" = Neutrophil_extracellular_Trap_formation)
+```
+
+## SSGSEA
+
+```{r}
+#GSVA_N <- t(gsva(count_N, modules, mx.diff=T,method="GSVA",kcdf = "Gaussian",abs.ranking=F)) 
+GSVA <- t(gsva(GSVA_Expr, gs,method="ssgsea",mx.diff=T,BPPARAM=MulticoreParam(24)))
+colnames(GSVA)
+## merge GSVA data with traidata
+df<- NULL
+if (all(rownames(GSVA) == rownames(traitData))) {
+  df <- cbind(traitData,GSVA)
+}
+
+if (all(rownames(df) == rownames(datExpr))) {
+  df <- data.frame(df,TNF=datExpr$TNF,IL1B=datExpr$IL1B,
+                   IL10=datExpr$IL10,
+                   IFNg=datExpr$IFNG)
+}
+
+dim(df)
+df %<>% subset(timepoint=="D0")
+
+colnames(df)
+```
+
+## BOX plot 4 Group
+### Plot for inflammatory genes
+```{r}
+i=0
+
+colkey = c('Healthy' = "#252525", 'PTB' = 'forestgreen', "HIVneg TBM"='royalblue',"HIVpos TBM"="#de2d26")
+
+gene = "TNF"
+for (gene in c("TNF", "IL1B", "IL10", "IFNg")) {
+  i = i + 1
+  print(paste0(i,". ",gene))
+  # data to plot 
+  df_plot <- df %>%
+    dplyr::select(all_of(gene),group_HIV,Groups)
+  colnames(df_plot)[1:3] <- c("gene", "Study", "Groups")
+  P <- ggplot(df_plot, aes(x = Study, y = gene)) +
+    geom_boxplot(size=1,position=position_dodge(1),width=0.7,
+                 fill="white",outlier.colour="red",
+                 outlier.shape=NA,outlier.size=3)+
+    geom_jitter(aes(color=Study,fill=Study),width=0.2,size=2,alpha = 0.5)+
+    scale_color_manual(values=c("#252525","#00441b","#3182bd","#de2d26"))+
+    theme_bw()+
+    labs(x="",y = "Log2 normalized expression", title = gene)+
+    theme(plot.title = element_text(size = 25),
+          legend.text = element_text(size = 20) ,
+          #legend.position="bottom",
+          legend.title = element_text(size = 20,color="black",face="bold"),
+          axis.text = element_text(size = 25),
+          axis.text.x=element_text(color="black",size=13,face="bold"),
+          axis.title.x = element_text(size = 20,color="black",face="bold"),
+          axis.text.y=element_text(color="black",size=20),
+          axis.title.y = element_text(size = 20,color="black",face="bold"),
+          axis.title= element_text(size = 40,color="black",face="bold"))+
+    scale_x_discrete("",labels = c("Healthy" = "Healthy \n Controls",
+                                   "PTB" = "PTB",
+                                   "HIVneg-TBM"="HIVneg\nTBM",
+                                   "HIVpos-TBM"="HIVpos\nTBM"))
+  jpeg(file =  paste0(output,"general_output/ssgsea/gene/",gene,"_boxplot.jpeg"), wi = 7.3, 
+       he = 6, units = "in",res=480)
+  print(P)
+  dev.off()
+}
+
+```
+
+### Plot for Pathway
+
+```{r}
+i=0
+for (gene in c(names(gs))) {
+  i = i + 1
+  print(paste0(i,". ",gene))
+  # data to plot 
+  df_plot <- df %>%
+    dplyr::select(all_of(gene),group_HIV,Groups)
+  colnames(df_plot)[1:3] <- c("gene", "Study", "Groups")
+  title <- str_replace_all(gene,"_", " ")
+  P <- ggplot(df_plot, aes(x = Study, y = gene)) +
+    geom_boxplot(size=1,position=position_dodge(1),width=0.7,
+                 fill="white",outlier.colour="red",
+                 outlier.shape=NA,outlier.size=3)+
+    geom_jitter(aes(color=Study,fill=Study),width=0.2,size=2,alpha = 0.5)+
+    scale_color_manual(values=c("#252525","#00441b","#3182bd","#de2d26"))+
+    theme_bw()+
+    labs(x="",y = "Enrichment Score", title = title)+
+    theme(plot.title = element_text(size = 25),
+          legend.text = element_text(size = 20) ,
+          #legend.position="bottom",
+          legend.title = element_text(size = 20,color="black",face="bold"),
+          axis.text = element_text(size = 25),
+          axis.text.x=element_text(color="black",size=13,face="bold"),
+          axis.title.x = element_text(size = 20,color="black",face="bold"),
+          axis.text.y=element_text(color="black",size=20),
+          axis.title.y = element_text(size = 20,color="black",face="bold"),
+          axis.title= element_text(size = 40,color="black",face="bold"))+
+    scale_x_discrete("",labels = c("Healthy" = "Healthy \n Controls",
+                                   "PTB" = "PTB",
+                                   "HIVneg-TBM"="HIVneg\nTBM",
+                                   "HIVpos-TBM"="HIVpos\nTBM"))
+  jpeg(file =  paste0(output,"general_output/ssgsea/",gene,"_boxplot.jpeg"), wi = 7.3, 
+       he = 6, units = "in",res=480)
+  print(P)
+  dev.off()
+}
+```
+
+## Qusage
+
+```{r}
+## exclude Th17 pathways
+gs$Th17_cell_differentiation <- NULL
+## exclude Th17 pathways
+gs$Cytokine_cytokine_receptor_interaction <- NULL
+
+module="blue"
+design <- qusage_traitData$status
+contrast="Yes-No"
+qs.results = qusage(qusage_Expr, design, contrast, gs)
+summary(qs.results)
+jpeg(file =  paste0(output,"general_output/qusage/","AllTBM_DeathvsSur_",module,"_module.jpeg"), wi = 7,
+       he = 5, units = "in",res=480)
+plotCIs(qs.results,  cex.xaxis=0.5,ylab="log2 fold change of pathway activity")
+dev.off()
+
+design <- qusage_traitData$group_qusage
+contrast="HIVpos_D-HIVpos_S"
+qs.results1 = qusage(qusage_Expr, design, contrast, gs)
+summary(qs.results1)
+# plotCIs(qs.results1)
+
+contrast="HIVneg_D-HIVneg_S"
+qs.results2 = qusage(qusage_Expr, design, contrast, gs)
+summary(qs.results2)
+# plotCIs(qs.results2)
+
+jpeg(file =  paste0(output,"general_output/qusage/","TBMHIVposvsHIVNeg_",module,"_module.jpeg"), wi = 7,
+       he = 7, units = "in",res=480)
+Plot_CI_Quasage(qs.results1,qs.results2, mar = c(4,18,4,0),cex.axis = 1.1, cex.lab = 1.1)
+dev.off()
+```
+
+
+
+
+# 3. Brown Module
+
+## GO
+
+```{r}
+## brown GO
+B_cell_activation <- get_genelist_pathway(name="B cell activation")
+B_cell_receptor_signaling_pathway <- get_genelist_pathway(name="B cell receptor signaling pathway")
+T_cell_activation <- get_genelist_pathway(name="T cell activation")
+Adaptive_immune_response <- get_genelist_pathway(name="adaptive immune response")
+Lymphocyte_proliferation  <- get_genelist_pathway(name="lymphocyte proliferation")
+Immune_response_activating_cell_surface_receptor_signaling_pathway <- get_genelist_pathway(name="immune response-activating cell surface receptor signaling pathway")
+Reg_of_B_cell_activation <- get_genelist_pathway(name="regulation of B cell activation")
+Leukocyte_cell_cell_adhesion <- get_genelist_pathway(name="leukocyte cell-cell adhesion")
+
+Reg_of_antigen_receptor_mediated_signaling_pathway <- get_genelist_pathway(name="regulation of antigen receptor-mediated signaling pathway")
+```
+
+## KEGG
+
+```{r}
+Hematopoietic_cell_lineage <- get_genelist_pathway_kegg(hsa_ID = "hsa04640")
+Cytokine_cytokine_receptor_interaction <- get_genelist_pathway_kegg(hsa_ID = "hsa04060")
+T_cell_receptor_signaling_pathway <- get_genelist_pathway_kegg(hsa_ID = "hsa04660")
+NF_kappa_B_signaling_pathway <- get_genelist_pathway_kegg(hsa_ID = "hsa04064")
+B_cell_receptor_signaling_pathway_KEGG <- get_genelist_pathway_kegg(hsa_ID = "hsa04662")
+Cell_adhesion_molecules <- get_genelist_pathway_kegg(hsa_ID = "hsa04514")
+```
+
+## GS
+
+```{r}
+gs <- list("B_cell_activation"=B_cell_activation,
+           "B_cell_receptor_signaling_pathway" = B_cell_receptor_signaling_pathway,
+           "T_cell_activation" = T_cell_activation,
+           "Adaptive_immune_response"= Adaptive_immune_response,
+           "Lymphocyte_proliferation" = Lymphocyte_proliferation,
+           "Immune_response_activating_CSR_signaling*" = Immune_response_activating_cell_surface_receptor_signaling_pathway,
+           "Reg_of_B_cell_activation" = Reg_of_B_cell_activation,
+           "Leukocyte_cell_cell_adhesion" = Leukocyte_cell_cell_adhesion,
+           "Reg_of_antigen_receptor_mediated_signaling" = Reg_of_antigen_receptor_mediated_signaling_pathway,
+           "Hematopoietic_cell_lineage" = Hematopoietic_cell_lineage,
+           "Cytokine_cytokine_receptor_interaction" = Cytokine_cytokine_receptor_interaction,
+           "T_cell_receptor_signaling_pathway" = T_cell_receptor_signaling_pathway,
+           "NF_kappa_B_signaling_pathway" = NF_kappa_B_signaling_pathway,
+           #"B_cell_receptor_signaling_pathway_KEGG" = B_cell_receptor_signaling_pathway_KEGG,
+           "Cell_adhesion_molecules" = Cell_adhesion_molecules)
+```
+
+## SSGSEA
+
+```{r}
+GSVA_Expr <- t(as.matrix(datExpr))
+#GSVA_N <- t(gsva(count_N, modules, mx.diff=T,method="GSVA",kcdf = "Gaussian",abs.ranking=F)) 
+GSVA <- t(gsva(GSVA_Expr, gs,method="ssgsea",mx.diff=F,BPPARAM=MulticoreParam(24)))
+colnames(GSVA)
+## merge GSVA data with traidata
+df<- NULL
+if (all(rownames(GSVA) == rownames(traitData))) {
+  df <- cbind(traitData,GSVA)
+}
+dim(df)
+df %<>% subset(timepoint=="D0")
+
+```
+
+## Plot for Pathway
+
+```{r}
+i=0
+for (gene in c(names(gs))) {
+  i = i + 1
+  print(paste0(i,". ",gene))
+  # data to plot 
+  df_plot <- df %>%
+    dplyr::select(all_of(gene),group_HIV,Groups)
+  colnames(df_plot)[1:3] <- c("gene", "Study", "Groups")
+  title <- str_replace_all(gene,"_", " ")
+  P <- ggplot(df_plot, aes(x = Study, y = gene)) +
+    geom_boxplot(size=1,position=position_dodge(1),width=0.7,
+                 fill="white",outlier.colour="red",
+                 outlier.shape=NA,outlier.size=3)+
+    geom_jitter(aes(color=Study,fill=Study),width=0.2,size=2,alpha = 0.5)+
+    scale_color_manual(values=c("#252525","#00441b","#3182bd","#de2d26"))+
+    theme_bw()+
+    labs(x="",y = "Enrichment Score", title = title)+
+    theme(plot.title = element_text(size = 25),
+          legend.text = element_text(size = 20) ,
+          #legend.position="bottom",
+          legend.title = element_text(size = 20,color="black",face="bold"),
+          axis.text = element_text(size = 25),
+          axis.text.x=element_text(color="black",size=13,face="bold"),
+          axis.title.x = element_text(size = 20,color="black",face="bold"),
+          axis.text.y=element_text(color="black",size=20),
+          axis.title.y = element_text(size = 20,color="black",face="bold"),
+          axis.title= element_text(size = 40,color="black",face="bold"))+
+    scale_x_discrete("",labels = c("Healthy" = "Healthy \n Controls",
+                                   "PTB" = "PTB",
+                                   "HIVneg-TBM"="HIVneg\nTBM",
+                                   "HIVpos-TBM"="HIVpos\nTBM"))
+  jpeg(file =  paste0(output,"general_output/ssgsea/",gene,"_boxplot.jpeg"), wi = 7.3, 
+       he = 6, units = "in",res=480)
+  print(P)
+  dev.off()
+}
+```
+
+## Qusage
+
+```{r}
+qusage_traitData %<>% mutate(status=status1)
+## exclude Th17 pathways
+
+module="brown"
+design <- qusage_traitData$status
+contrast="Yes-No"
+qs.results = qusage(qusage_Expr, design, contrast, gs)
+summary(qs.results)
+jpeg(file =  paste0(output,"general_output/qusage/","AllTBM_DeathvsSur_",module,"_module.jpeg"), wi = 7,
+       he = 5, units = "in",res=480)
+plotCIs(qs.results,  cex.xaxis=0.5,ylab="log2 fold change of pathway activity")
+dev.off()
+
+design <- qusage_traitData$group_qusage
+contrast="HIVpos_D-HIVpos_S"
+qs.results1 = qusage(qusage_Expr, design, contrast, gs)
+summary(qs.results1)
+# plotCIs(qs.results1)
+
+contrast="HIVneg_D-HIVneg_S"
+qs.results2 = qusage(qusage_Expr, design, contrast, gs)
+summary(qs.results2)
+# plotCIs(qs.results2)
+
+jpeg(file =  paste0(output,"general_output/qusage/","TBMHIVposvsHIVNeg_",module,"_module.jpeg"), wi = 7,
+       he = 7, units = "in",res=480)
+Plot_CI_Quasage(qs.results1,qs.results2, mar = c(4,19,4,0),cex.axis = 1.1, cex.lab = 1.1)
+dev.off()
+```
+
+
+
+# 4. Red Module
+
+## GO
+
+```{r}
+## red GO
+T_cell_activation <- get_genelist_pathway(name="T cell activation")
+T_cell_selection  <- get_genelist_pathway(name="T cell selection")
+Cellular_response_to_IL4   <- get_genelist_pathway(name="cellular response to interleukin-4")
+Pos_reg_of_T_cell_activation <- get_genelist_pathway(name="positive regulation of T cell activation")
+Pos_reg_of_cell_adhesion  <- get_genelist_pathway(name="positive regulation of cell adhesion")
+```
+
+## KEGG
+
+```{r}
+Th17_cell_differentiation <- get_genelist_pathway_kegg(hsa_ID = "hsa04659")
+Th1_and_Th2_cell_differentiation <- get_genelist_pathway_kegg(hsa_ID = "hsa04658")
+T_cell_receptor_signaling_pathway <- get_genelist_pathway_kegg(hsa_ID = "hsa04660")
+Hematopoietic_cell_lineage <- get_genelist_pathway_kegg(hsa_ID = "hsa04640")
+```
+
+## GS
+
+```{r}
+gs <- list("T_cell_activation"=T_cell_activation,
+           "T_cell_selection" = T_cell_selection,
+           "Cellular_response_to_IL4" = Cellular_response_to_IL4,
+           "Pos_reg_of_T_cell_activation"= Pos_reg_of_T_cell_activation,
+           "Pos_reg_of_cell_adhesion" = Pos_reg_of_cell_adhesion,
+           "Th17_cell_differentiation" = Th17_cell_differentiation,
+           "Th1_and_Th2_cell_differentiation" = Th1_and_Th2_cell_differentiation,
+           "T_cell_receptor_signaling_pathway" = T_cell_receptor_signaling_pathway,
+           "Hematopoietic_cell_lineage" = Hematopoietic_cell_lineage)
+```
+
+## SSGSEA
+
+```{r}
+GSVA_Expr <- t(as.matrix(datExpr))
+#GSVA_N <- t(gsva(count_N, modules, mx.diff=T,method="GSVA",kcdf = "Gaussian",abs.ranking=F)) 
+GSVA <- t(gsva(GSVA_Expr, gs,method="ssgsea",mx.diff=F,BPPARAM=MulticoreParam(24)))
+colnames(GSVA)
+## merge GSVA data with traidata
+df<- NULL
+if (all(rownames(GSVA) == rownames(traitData))) {
+  df <- cbind(traitData,GSVA)
+}
+
+dim(df)
+df %<>% subset(timepoint=="D0")
+
+```
+
+### Plot for Pathway
+
+```{r}
+i=0
+for (gene in c(names(gs))) {
+  i = i + 1
+  print(paste0(i,". ",gene))
+  # data to plot 
+  df_plot <- df %>%
+    dplyr::select(all_of(gene),group_HIV,Groups)
+  colnames(df_plot)[1:3] <- c("gene", "Study", "Groups")
+  title <- str_replace_all(gene,"_", " ")
+  P <- ggplot(df_plot, aes(x = Study, y = gene)) +
+    geom_boxplot(size=1,position=position_dodge(1),width=0.7,
+                 fill="white",outlier.colour="red",
+                 outlier.shape=NA,outlier.size=3)+
+    geom_jitter(aes(color=Study,fill=Study),width=0.2,size=2,alpha = 0.5)+
+    scale_color_manual(values=c("#252525","#00441b","#3182bd","#de2d26"))+
+    theme_bw()+
+    labs(x="",y = "Enrichment Score", title = title)+
+    theme(plot.title = element_text(size = 25),
+          legend.text = element_text(size = 20) ,
+          #legend.position="bottom",
+          legend.title = element_text(size = 20,color="black",face="bold"),
+          axis.text = element_text(size = 25),
+          axis.text.x=element_text(color="black",size=13,face="bold"),
+          axis.title.x = element_text(size = 20,color="black",face="bold"),
+          axis.text.y=element_text(color="black",size=20),
+          axis.title.y = element_text(size = 20,color="black",face="bold"),
+          axis.title= element_text(size = 40,color="black",face="bold"))+
+    scale_x_discrete("",labels = c("Healthy" = "Healthy \n Controls",
+                                   "PTB" = "PTB",
+                                   "HIVneg-TBM"="HIVneg\nTBM",
+                                   "HIVpos-TBM"="HIVpos\nTBM"))
+  jpeg(file =  paste0(output,"general_output/ssgsea/",gene,"_boxplot.jpeg"), wi = 7.3, 
+       he = 6, units = "in",res=480)
+  print(P)
+  dev.off()
+}
+```
+
+## Qusage
+
+```{r}
+qusage_traitData %<>% mutate(status=status1)
+module="red"
+design <- qusage_traitData$status
+contrast="Yes-No"
+qs.results = qusage(qusage_Expr, design, contrast, gs)
+summary(qs.results)
+jpeg(file =  paste0(output,"general_output/qusage/","AllTBM_DeathvsSur_",module,"_module.jpeg"), wi = 7,
+       he = 5, units = "in",res=480)
+plotCIs(qs.results,  cex.xaxis=0.5,ylab="log2 fold change of pathway activity")
+dev.off()
+
+design <- qusage_traitData$group_qusage
+contrast="HIVpos_D-HIVpos_S"
+qs.results1 = qusage(qusage_Expr, design, contrast, gs)
+summary(qs.results1)
+# plotCIs(qs.results1)
+
+contrast="HIVneg_D-HIVneg_S"
+qs.results2 = qusage(qusage_Expr, design, contrast, gs)
+summary(qs.results2)
+# plotCIs(qs.results2)
+
+jpeg(file =  paste0(output,"general_output/qusage/","TBMHIVposvsHIVNeg_",module,"_module.jpeg"), wi = 7,
+       he = 7, units = "in",res=480)
+Plot_CI_Quasage(qs.results1,qs.results2, mar = c(4,15,4,0),cex.axis = 1.1, cex.lab = 1.1)
+dev.off()
+```
+
+
+# 5. Cyan Module
+
+## GO
+
+```{r}
+## brown GO
+Kidney_development  <- get_genelist_pathway(name="kidney development")
+Mesonephros_development   <- get_genelist_pathway(name="mesonephros development")
+```
+
+## GS
+
+```{r}
+gs <- list("Kidney_development"=Kidney_development,
+           "Mesonephros_development" = Mesonephros_development)
+```
+
+## SSGSEA
+
+```{r}
+GSVA_Expr <- t(as.matrix(datExpr))
+#GSVA_N <- t(gsva(count_N, modules, mx.diff=T,method="GSVA",kcdf = "Gaussian",abs.ranking=F)) 
+GSVA <- t(gsva(GSVA_Expr, gs,method="ssgsea",mx.diff=F,BPPARAM=MulticoreParam(24)))
+colnames(GSVA)
+## merge GSVA data with traidata
+df<- NULL
+if (all(rownames(GSVA) == rownames(traitData))) {
+  df <- cbind(traitData,GSVA)
+}
+dim(df)
+df %<>% subset(timepoint=="D0")
+
+```
+
+## BOX plot 3 Group
+
+```{r}
+gene=names(gs)[1]
+i=0
+N_GO=2
+for (gene in names(gs)) {
+  i = i + 1
+  print(paste0(i,". ",gene))
+  ## calculate wilcox TBM
+  df_test1 <- df %>%
+    subset(group=="TBM") %>%
+    dplyr::select(all_of(gene),status) %>%
+    mutate(status=factor(status))
+  colnames(df_test1)[1] <- "gene"
+  test <- df_test1 %>%
+    tbl_summary(by = status) %>%
+    add_p()
+  pval <- test$table_body$p.value
+  if(pval < 0.1){
+    sig1 = as.character(gtools::stars.pval(pval))
+    size_sig1 = 15
+  } else  {
+    sig1 <- "NS"
+    size_sig1 = 7}
+  label.df1 <- data.frame(group = c("TBM"),
+                          gene = max(c(df_test1$gene))+ 0.01)
+
+  # data to plot 
+  df_plot <- df %>%
+    dplyr::select(all_of(gene),group,Groups)
+  colnames(df_plot)[1] <- "gene"
+  P <- ggplot(df_plot, aes(x = group, y = gene)) +
+    geom_boxplot(size=1,position=position_dodge(1),width=0.7,
+                 fill="white",outlier.colour="red",
+                 outlier.shape=NA,outlier.size=3)+
+    geom_jitter(aes(color=Groups,fill=Groups),width=0.2,size=2,alpha = 0.5)+
+    scale_color_manual(values=c("#252525","#00441b","#3182bd","#de2d26"))+
+    theme_bw()+
+    labs(x="",y = "Enrichment score", title = gene)+#,subtitle = ""
+    theme(plot.title = element_text(size = 25),
+          legend.text = element_text(size = 20) ,
+          #legend.position="bottom",
+          legend.title = element_text(size = 20,color="black",face="bold"),
+          axis.text = element_text(size = 25),
+          axis.text.x=element_text(color="black",size=13,face="bold"),
+          axis.title.x = element_text(size = 20,color="black",face="bold"),
+          axis.text.y=element_text(color="black",size=20),
+          axis.title.y = element_text(size = 20,color="black",face="bold"),
+          axis.title= element_text(size = 40,color="black",face="bold"))+
+    scale_x_discrete("",labels = c("Healthy" = "Healthy \n Controls",
+                                   "PTB" = "PTB",
+                                   "TBM"="TBM")) +
+    geom_text(data = label.df1, label = sig1, size=size_sig1) 
+  if( i < N_GO+1 ){
+    jpeg(file =  paste0(output,"general_output/ssgsea/cyan/GO/",gene,"_boxplot.jpeg"), wi = 7, 
+       he = 6, units = "in",res=480)
+  } else{ jpeg(file =  paste0(output,"general_output/ssgsea/cyan/KEGG/",gene,"_boxplot.jpeg"), wi = 7, 
+       he = 6, units = "in",res=480)}
+  print(P)
+  dev.off()
+}
+```
+
+
+## BOX plot 4 Group
+
+```{r}
+i=0
+for (gene in names(gs)) {
+  i = i + 1
+  print(paste0(i,". ",gene))
+  ## calculate wilcox 27TB
+  df_test1 <- df %>%
+    subset(Study=="27TB") %>%
+    dplyr::select(all_of(gene),status) %>%
+    mutate(status=factor(status))
+  colnames(df_test1)[1] <- "gene"
+  test <- df_test1 %>%
+    tbl_summary(by = status) %>%
+    add_p()
+  pval <- test$table_body$p.value
+  if(pval < 0.1){
+    sig1 = as.character(gtools::stars.pval(pval))
+    size_sig1 = 15
+  } else  {
+    sig1 <- ""
+    size_sig1 = 7}
+  df_test2 <- df %>%
+    subset(Study=="26TB") %>%
+    dplyr::select(all_of(gene),status) %>%
+    mutate(status=factor(status))
+  colnames(df_test2)[1] <- "gene"
+  test <- df_test2 %>%
+    tbl_summary(by = status) %>%
+    add_p()
+  pval <- test$table_body$p.value
+  if(pval < 0.1){
+    sig2 <- as.character(gtools::stars.pval(pval))
+    size_sig2 = 15
+  } else {
+    sig2 <- ""
+    size_sig2 = 7}
+  df_test3 <- df %>%
+    subset(Study %in% c("26TB","27TB")) %>%
+    dplyr::select(all_of(gene),Study) %>%
+    mutate(Study=factor(Study))
+  colnames(df_test3)[1] <- "gene"
+  test <- df_test3 %>%
+    tbl_summary(by = Study) %>%
+    add_p()
+  pval <- test$table_body$p.value
+  if(pval < 0.1){
+    sig3 <- as.character(gtools::stars.pval(pval))
+    size_sig3 = 15
+  } else {
+    sig3 <- ""
+    size_sig3 = 7}
+  
+  label.df1 <- data.frame(group_HIV = c("HIVneg-TBM"),
+                          gene = max(c(df_test1$gene,df_test2$gene))+ 0.01)
+  label.df2 <- data.frame(group_HIV = c("HIVpos-TBM"),
+                          gene = max(c(df_test1$gene,df_test2$gene))+ 0.01)
+  label.df3 <- data.frame(group_HIV = c("HIVpos-TBM"),
+                          gene = max(df_test3$gene)+ 0.035)
+  # data to plot 
+  df_plot <- df %>%
+    dplyr::select(all_of(gene),group_HIV,Groups)
+  colnames(df_plot)[1] <- "gene"
+  P <- ggplot(df_plot, aes(x = group_HIV, y = gene)) +
+    geom_boxplot(size=1,position=position_dodge(1),width=0.7,
+                 fill="white",outlier.colour="red",
+                 outlier.shape=NA,outlier.size=3)+
+    geom_jitter(aes(color=Groups,fill=Groups),width=0.2,size=2,alpha = 0.5)+
+    scale_color_manual(values=c("#252525","#00441b","#3182bd","#de2d26"))+
+    theme_bw()+
+    labs(x="",y = "Enrichment score", title = gene)+#,subtitle = ""
+    theme(plot.title = element_text(size = 25),
+          legend.text = element_text(size = 20) ,
+          #legend.position="bottom",
+          legend.title = element_text(size = 20,color="black",face="bold"),
+          axis.text = element_text(size = 25),
+          axis.text.x=element_text(color="black",size=13,face="bold"),
+          axis.title.x = element_text(size = 20,color="black",face="bold"),
+          axis.text.y=element_text(color="black",size=20),
+          axis.title.y = element_text(size = 20,color="black",face="bold"),
+          axis.title= element_text(size = 40,color="black",face="bold"))+
+    scale_x_discrete("",labels = c("Healthy" = "Healthy \n Controls",
+                                   "PTB" = "PTB",
+                                   "HIVneg-TBM"="HIVneg\nTBM",
+                                   "HIVpos-TBM"="HIVpos\nTBM")) +
+    geom_text(data = label.df1, label = sig1, size=size_sig1) +
+    geom_text(data = label.df2, label = sig2, size=size_sig2)
+  if(sig3 != "") {
+    P <- P +  geom_text(data = label.df3, aes(x=3.5, y=gene), label = sig3, size=size_sig3) +
+      annotate("rect", xmin = 3, xmax = 4, ymin = label.df3$gene,
+                  ymax =label.df3$gene + 0.001, alpha=1,colour = "black") +
+      annotate("rect", xmin = 3, xmax = 3 + 0.01, ymin = label.df3$gene -0.002,
+                  ymax =label.df3$gene, alpha=1,colour = "black") +
+      annotate("rect", xmin = 4 - 0.01, xmax = 4, ymin = label.df3$gene - 0.002,
+                  ymax =label.df3$gene, alpha=1,colour = "black")
+  }
+  if( i < N_GO+1 ){
+    jpeg(file =  paste0(output,"general_output/ssgsea_4group/cyan/GO/",gene,"_boxplot.jpeg"), wi = 7, 
+       he = 6, units = "in",res=480)
+  } else{ jpeg(file =  paste0(output,"general_output/ssgsea_4group/cyan/KEGG/",gene,"_boxplot.jpeg"), wi = 7, 
+       he = 6, units = "in",res=480)}
+  print(P)
+  dev.off()
+}
+
+```
+
+## Qusage
+
+```{r}
+qusage_traitData %<>% mutate(status=status1)
+module="cyan"
+design <- qusage_traitData$status
+contrast="Yes-No"
+qs.results = qusage(qusage_Expr, design, contrast, gs)
+summary(qs.results)
+jpeg(file =  paste0(output,"general_output/qusage/","AllTBM_DeathvsSur_",module,"_module.jpeg"), wi = 7,
+       he = 5, units = "in",res=480)
+plotCIs(qs.results,  cex.xaxis=0.5,ylab="log2 fold change of pathway activity")
+dev.off()
+
+design <- qusage_traitData$group_qusage
+contrast="HIVpos_D-HIVpos_S"
+qs.results1 = qusage(qusage_Expr, design, contrast, gs)
+summary(qs.results1)
+# plotCIs(qs.results1)
+
+contrast="HIVneg_D-HIVneg_S"
+qs.results2 = qusage(qusage_Expr, design, contrast, gs)
+summary(qs.results2)
+# plotCIs(qs.results2)
+
+jpeg(file =  paste0(output,"general_output/qusage/","TBMHIVposvsHIVNeg_",module,"_module.jpeg"), wi = 7,
+       he = 10, units = "in",res=480)
+Plot_CI_Quasage(qs.results1,qs.results2, mar = c(4,15,4,0))
+dev.off()
+```
+
+
+# 6 Specific Blue modules
+## GO
+
+```{r}
+output2 <- "WGCNA/All_study/Consensus_TBM/General/"
+yellow_consensus <- read.csv(paste0(output2,"general_output/yellow_Conssensus_modules_MMandGS.csv")) %>%
+  dplyr::arrange(totalRank_HIVneg)
+
+blue_consensus <- read.csv(paste0(output2,"general_output/blue_Conssensus_modules_MMandGS.csv")) %>%
+  dplyr::arrange(totalRank_HIVpos) 
+
+specific_module <- rbind(yellow_consensus,blue_consensus)
+
+dim(specific_module)
+```
+
+
+```{r}
+Small_GTPase_mediated_signal_transduction <- 
+  get_genelist_pathway(name="small GTPase mediated signal transduction")
+Small_GTPase_mediated_signal_transduction <- Small_GTPase_mediated_signal_transduction[which(Small_GTPase_mediated_signal_transduction %in% specific_module$gene)]
+
+Pos_reg_of_locomotion <-
+  get_genelist_pathway(name="positive regulation of locomotion")
+Pos_reg_of_locomotion <- Pos_reg_of_locomotion[which(Pos_reg_of_locomotion %in% specific_module$gene)]
+
+Angiogenesis <- get_genelist_pathway(name="angiogenesis")
+Angiogenesis <- Angiogenesis[which(Angiogenesis %in% specific_module$gene)]
+
+Rap1_signaling_pathway <- get_genelist_pathway_kegg(hsa_ID = "hsa04015")
+Rap1_signaling_pathway <- Rap1_signaling_pathway[which(Rap1_signaling_pathway %in% specific_module$gene)]
+
+Blood_vessel_development <- get_genelist_pathway(name="blood vessel development")
+Blood_vessel_development <- Blood_vessel_development[which(Blood_vessel_development %in% specific_module$gene)]
+
+Extracellular_matrix_organization <- get_genelist_pathway(name="extracellular matrix organization")
+Extracellular_matrix_organization <- Extracellular_matrix_organization[which(Extracellular_matrix_organization %in% specific_module$gene)]
+
+Cell_substrate_adhesion  <- get_genelist_pathway(name="cell-substrate adhesion")
+Cell_substrate_adhesion <- Cell_substrate_adhesion[which(Cell_substrate_adhesion %in% specific_module$gene)]
+
+Neg_reg_of_establishment_of_protein_localization <-
+  get_genelist_pathway(name="negative regulation of establishment of protein localization")
+Neg_reg_of_establishment_of_protein_localization <- Neg_reg_of_establishment_of_protein_localization[which(Neg_reg_of_establishment_of_protein_localization %in% specific_module$gene)]
+
+Gland_development <-  get_genelist_pathway(name="gland development")
+Gland_development <- Gland_development[which(Gland_development %in% specific_module$gene)]
+
+```
+
+
+## GS
+
+```{r}
+gs = list("Small_GTPase_mediated_signal_transduction" =Small_GTPase_mediated_signal_transduction,
+          "Pos_reg_of_locomotion"=Pos_reg_of_locomotion,
+          "Rap1_signaling_pathway" = Rap1_signaling_pathway,
+          "Angiogenesis"=Angiogenesis,
+          "Blood_vessel_development" =Blood_vessel_development,
+          "Extracellular_matrix_organization"=Extracellular_matrix_organization,
+          "Cell_substrate_adhesion" =Cell_substrate_adhesion,
+          "Neg_reg_of_establishment_of_protein_localization" =Neg_reg_of_establishment_of_protein_localization,
+          "Gland_development" =Gland_development
+)
+```
+
+
+## SSGSEA
+
+```{r}
+GSVA_Expr <- t(as.matrix(datExpr))
+#GSVA_N <- t(gsva(count_N, modules, mx.diff=T,method="GSVA",kcdf = "Gaussian",abs.ranking=F)) 
+GSVA <- t(gsva(GSVA_Expr, gs,method="ssgsea",mx.diff=F,BPPARAM=MulticoreParam(24)))
+colnames(GSVA)
+## merge GSVA data with traidata
+df<- NULL
+if (all(rownames(GSVA) == rownames(traitData))) {
+  df <- cbind(traitData,GSVA)
+}
+dim(df)
+df %<>% subset(timepoint=="D0")
+
+```
+
+
+## BOX plot 4 Group
+
+```{r}
+i=0
+for (gene in names(gs)) {
+  i = i + 1
+  print(paste0(i,". ",gene))
+  ## calculate wilcox 27TB
+  df_test1 <- df %>%
+    subset(Study=="27TB") %>%
+    dplyr::select(all_of(gene),status) %>%
+    mutate(status=factor(status))
+  colnames(df_test1)[1] <- "gene"
+  test <- df_test1 %>%
+    tbl_summary(by = status) %>%
+    add_p()
+  pval <- test$table_body$p.value
+  if(pval < 0.1){
+    sig1 = as.character(gtools::stars.pval(pval))
+    size_sig1 = 15
+  } else  {
+    sig1 <- ""
+    size_sig1 = 7}
+  df_test2 <- df %>%
+    subset(Study=="26TB") %>%
+    dplyr::select(all_of(gene),status) %>%
+    mutate(status=factor(status))
+  colnames(df_test2)[1] <- "gene"
+  test <- df_test2 %>%
+    tbl_summary(by = status) %>%
+    add_p()
+  pval <- test$table_body$p.value
+  if(pval < 0.1){
+    sig2 <- as.character(gtools::stars.pval(pval))
+    size_sig2 = 15
+  } else {
+    sig2 <- ""
+    size_sig2 = 7}
+  df_test3 <- df %>%
+    subset(Study %in% c("26TB","27TB")) %>%
+    dplyr::select(all_of(gene),Study) %>%
+    mutate(Study=factor(Study))
+  colnames(df_test3)[1] <- "gene"
+  test <- df_test3 %>%
+    tbl_summary(by = Study) %>%
+    add_p()
+  pval <- test$table_body$p.value
+  if(pval < 0.1){
+    sig3 <- as.character(gtools::stars.pval(pval))
+    size_sig3 = 15
+  } else {
+    sig3 <- ""
+    size_sig3 = 7}
+  
+  label.df1 <- data.frame(group_HIV = c("HIVneg-TBM"),
+                          gene = max(c(df_test1$gene,df_test2$gene))+ 0.01)
+  label.df2 <- data.frame(group_HIV = c("HIVpos-TBM"),
+                          gene = max(c(df_test1$gene,df_test2$gene))+ 0.01)
+  label.df3 <- data.frame(group_HIV = c("HIVpos-TBM"),
+                          gene = max(df_test3$gene)+ 0.035)
+  # data to plot 
+  df_plot <- df %>%
+    dplyr::select(all_of(gene),group_HIV,Groups)
+  colnames(df_plot)[1] <- "gene"
+  P <- ggplot(df_plot, aes(x = group_HIV, y = gene)) +
+    geom_boxplot(size=1,position=position_dodge(1),width=0.7,
+                 fill="white",outlier.colour="red",
+                 outlier.shape=NA,outlier.size=3)+
+    geom_jitter(aes(color=Groups,fill=Groups),width=0.2,size=2,alpha = 0.5)+
+    scale_color_manual(values=c("#252525","#00441b","#3182bd","#de2d26"))+
+    theme_bw()+
+    labs(x="",y = "Enrichment score", title = gene)+#,subtitle = ""
+    theme(plot.title = element_text(size = 25),
+          legend.text = element_text(size = 20) ,
+          #legend.position="bottom",
+          legend.title = element_text(size = 20,color="black",face="bold"),
+          axis.text = element_text(size = 25),
+          axis.text.x=element_text(color="black",size=13,face="bold"),
+          axis.title.x = element_text(size = 20,color="black",face="bold"),
+          axis.text.y=element_text(color="black",size=20),
+          axis.title.y = element_text(size = 20,color="black",face="bold"),
+          axis.title= element_text(size = 40,color="black",face="bold"))+
+    scale_x_discrete("",labels = c("Healthy" = "Healthy \n Controls",
+                                   "PTB" = "PTB",
+                                   "HIVneg-TBM"="HIVneg\nTBM",
+                                   "HIVpos-TBM"="HIVpos\nTBM")) +
+    geom_text(data = label.df1, label = sig1, size=size_sig1) +
+    geom_text(data = label.df2, label = sig2, size=size_sig2)
+  if(sig3 != "") {
+    P <- P +  geom_text(data = label.df3, aes(x=3.5, y=gene), label = sig3, size=size_sig3) +
+      annotate("rect", xmin = 3, xmax = 4, ymin = label.df3$gene,
+                  ymax =label.df3$gene + 0.001, alpha=1,colour = "black") +
+      annotate("rect", xmin = 3, xmax = 3 + 0.01, ymin = label.df3$gene -0.002,
+                  ymax =label.df3$gene, alpha=1,colour = "black") +
+      annotate("rect", xmin = 4 - 0.01, xmax = 4, ymin = label.df3$gene - 0.002,
+                  ymax =label.df3$gene, alpha=1,colour = "black")
+  }
+  jpeg(file =  paste0(output,"general_output/ssgsea_4group/specific/",gene,"_boxplot.jpeg"), wi = 7, 
+       he = 6, units = "in",res=480)
+  print(P)
+  dev.off()
+}
+
+```
+
+
+## Qusage
+
+
+
+```{r}
+## remove blood vessel pathays
+#gs$Blood_vessel_development <- NULL
+module="Specific_blue_and_yellow"
+design <- qusage_traitData$status
+contrast="Yes-No"
+qs.results = qusage(qusage_Expr, design, contrast, gs)
+summary(qs.results)
+jpeg(file =  paste0(output,"general_output/qusage/","AllTBM_DeathvsSur_",module,"_module_Filter.jpeg"), wi = 7,
+       he = 5, units = "in",res=480)
+plotCIs(qs.results,  cex.xaxis=0.5,ylab="log2 fold change of pathway activity")
+dev.off()
+
+design <- qusage_traitData$group_qusage
+contrast="HIVpos_D-HIVpos_S"
+qs.results1 = qusage(qusage_Expr, design, contrast, gs)
+summary(qs.results1)
+# plotCIs(qs.results1)
+
+contrast="HIVneg_D-HIVneg_S"
+qs.results2 = qusage(qusage_Expr, design, contrast, gs)
+summary(qs.results2)
+# plotCIs(qs.results2)
+
+jpeg(file =  paste0(output,"general_output/qusage/","TBMHIVposvsHIVNeg_",module,"_module_Filter.jpeg"), wi = 10,
+       he = 10, units = "in",res=480)
+Plot_CI_Quasage(qs.results1,qs.results2, mar = c(4,18,4,0))
+dev.off()
+```
+
+
+# 7. Other 
+
+## GO or KEGG
+```{r}
+Wnt_signaling_pathway_GO <- 
+  get_genelist_pathway(name="Wnt signaling pathway")
+Metalloendopeptidase_activity <- get_genelist_pathway(name="metalloendopeptidase activity")
+Wnt_signaling_pathway_KEGG <- get_genelist_pathway_kegg(hsa_ID = "hsa04310")
+
+VEGF_binding <- 
+  get_genelist_pathway(name="vascular endothelial growth factor binding")
+VEGF_signaling_pathway <- get_genelist_pathway_kegg(hsa_ID = "hsa04370")
+
+# type_I_interferon_mediated_signaling <- 
+#   get_genelist_pathway(name="type I interferon-mediated signaling pathway")
+```
+
+## Gs
+
+```{r}
+gs <- list("Wnt_signaling_pathway_GO" = Wnt_signaling_pathway_GO,
+           "Metalloendopeptidase_activity" = Metalloendopeptidase_activity,
+           "Wnt_signaling_pathway_KEGG"= Wnt_signaling_pathway_KEGG,
+           "VEGF_binding"=VEGF_binding,
+           "VEGF_signaling_pathway"=VEGF_signaling_pathway)
+```
+
+
+## SSGSEA
+
+```{r}
+GSVA_Expr <- t(as.matrix(datExpr))
+#GSVA_N <- t(gsva(count_N, modules, mx.diff=T,method="GSVA",kcdf = "Gaussian",abs.ranking=F)) 
+GSVA <- t(gsva(GSVA_Expr, gs,method="ssgsea",mx.diff=F,BPPARAM=MulticoreParam(24)))
+colnames(GSVA)
+## merge GSVA data with traidata
+df<- NULL
+if (all(rownames(GSVA) == rownames(traitData))) {
+  df <- cbind(traitData,GSVA)
+}
+
+names(traitData)
+IL11RA
+CD4
+PPP4R2
+ZNF395
+BCL9L
+
+dim(df)
+hub_genes <- c("TCEA3","TRABD2A","MCEMP1","PKD1", "ZNF354C", "CD28","FCAR", "OLFM4","CEACAM6", "ISG15","IFIT1", "WNT7A", "MAL", "CD4","IL11RA","PPP4R2","ZNF395",
+               "BCL9L")
+hub_data <- datExpr %>% dplyr::select(all_of(hub_genes))
+
+if (all(rownames(GSVA) == rownames(hub_data))) {
+  df <- cbind(df, hub_data)
+}
+
+dim(df)
+df %<>% subset(timepoint=="D0")
+
+```
+
+
+
+## BOX plot 4 Group
+
+```{r}
+gene="CD4"
+i=0
+for (gene in c(hub_genes)) {
+  i = i + 1
+  print(paste0(i,". ",gene))
+  ## calculate wilcox 27TB
+  df_test <- df %>% dplyr::select(all_of(gene))
+  colnames(df_test)[1] <- "gene"
+  df_test1 <- df %>%
+    subset(Study=="27TB") %>%
+    dplyr::select(all_of(gene),status) %>%
+    mutate(status=factor(status))
+  colnames(df_test1)[1] <- "gene"
+  test <- df_test1 %>%
+    tbl_summary(by = status) %>%
+    add_p()
+  pval <- test$table_body$p.value
+  if(pval < 0.1){
+    sig1 = as.character(gtools::stars.pval(pval))
+    size_sig1 = 15
+  } else  {
+    sig1 <- ""
+    size_sig1 = 7}
+  df_test2 <- df %>%
+    subset(Study=="26TB") %>%
+    dplyr::select(all_of(gene),status) %>%
+    mutate(status=factor(status))
+  colnames(df_test2)[1] <- "gene"
+  test <- df_test2 %>%
+    tbl_summary(by = status) %>%
+    add_p()
+  pval <- test$table_body$p.value
+  if(pval < 0.1){
+    sig2 <- as.character(gtools::stars.pval(pval))
+    size_sig2 = 15
+  } else {
+    sig2 <- ""
+    size_sig2 = 7}
+  df_test3 <- df %>%
+    subset(Study %in% c("26TB","27TB")) %>%
+    dplyr::select(all_of(gene),Study) %>%
+    mutate(Study=factor(Study))
+  colnames(df_test3)[1] <- "gene"
+  test <- df_test3 %>%
+    tbl_summary(by = Study) %>%
+    add_p()
+  pval <- test$table_body$p.value
+  if(pval < 0.1){
+    sig3 <- as.character(gtools::stars.pval(pval))
+    size_sig3 = 15
+  } else {
+    sig3 <- ""
+    size_sig3 = 7}
+  
+  label.df1 <- data.frame(group_HIV = c("HIVneg-TBM"),
+                          gene = max(c(df_test1$gene,df_test2$gene))+ 0.01)
+  label.df2 <- data.frame(group_HIV = c("HIVpos-TBM"),
+                          gene = max(c(df_test1$gene,df_test2$gene))+ 0.01)
+  label.df3 <- data.frame(group_HIV = c("HIVpos-TBM"),
+                          gene = max(df_test$gene)+ 0.035)
+  
+  if (gene %in% hub_genes) {
+    label.df1 <- data.frame(group_HIV = c("HIVneg-TBM"),
+                          gene = max(c(df_test1$gene,df_test2$gene))+ 0.5)
+    label.df2 <- data.frame(group_HIV = c("HIVpos-TBM"),
+                          gene = max(c(df_test1$gene,df_test2$gene))+ 00.5)
+    label.df3 <- data.frame(group_HIV = c("HIVpos-TBM"),
+                          gene = max(df_test$gene)+ 1)
+  }
+  
+  
+  # data to plot 
+  df_plot <- df %>%
+    dplyr::select(all_of(gene),group_HIV,Groups)
+  colnames(df_plot)[1] <- "gene"
+  table(is.na(df_plot$group_HIV))
+  P <- ggplot(df_plot, aes(x = group_HIV, y = gene)) +
+    geom_boxplot(size=1,position=position_dodge(1),width=0.7,
+                 fill="white",outlier.colour="red",
+                 outlier.shape=NA,outlier.size=3)+
+    geom_jitter(aes(color=Groups,fill=Groups),width=0.2,size=2,alpha = 0.5)+
+    scale_color_manual(values=c("#252525","#00441b","#3182bd","#de2d26"))+
+    theme_bw()+
+    labs(x="",y = "Log2 normalized expression", title = gene)+#,subtitle = ""
+    theme(plot.title = element_text(size = 25),
+          legend.text = element_text(size = 20) ,
+          #legend.position="bottom",
+          legend.title = element_text(size = 20,color="black",face="bold"),
+          axis.text = element_text(size = 25),
+          axis.text.x=element_text(color="black",size=13,face="bold"),
+          axis.title.x = element_text(size = 20,color="black",face="bold"),
+          axis.text.y=element_text(color="black",size=20),
+          axis.title.y = element_text(size = 20,color="black",face="bold"),
+          axis.title= element_text(size = 40,color="black",face="bold"))+
+    scale_x_discrete("",labels = c("Healthy" = "Healthy \n Controls",
+                                   "PTB" = "PTB",
+                                   "HIVneg-TBM"="HIVneg\nTBM",
+                                   "HIVpos-TBM"="HIVpos\nTBM")) +
+    geom_text(data = label.df1, label = sig1, size=size_sig1) +
+    geom_text(data = label.df2, label = sig2, size=size_sig2)
+  if(sig3 != "" & gene %nin% hub_genes) {
+    P <- P +  geom_text(data = label.df3, aes(x=3.5, y=gene), label = sig3, size=size_sig3) +
+      annotate("rect", xmin = 3, xmax = 4, ymin = label.df3$gene,
+                  ymax =label.df3$gene + 0.001, alpha=1,colour = "black") +
+      annotate("rect", xmin = 3, xmax = 3 + 0.01, ymin = label.df3$gene -0.002,
+                  ymax =label.df3$gene, alpha=1,colour = "black") +
+      annotate("rect", xmin = 4 - 0.01, xmax = 4, ymin = label.df3$gene - 0.002,
+                  ymax =label.df3$gene, alpha=1,colour = "black")
+  }
+  
+  if(sig3 != "" & gene %in% hub_genes) {
+    P <- P +  geom_text(data = label.df3, aes(x=3.5, y=gene), label = sig3, size=size_sig3) +
+      annotate("rect", xmin = 3, xmax = 4, ymin = label.df3$gene,
+                  ymax =label.df3$gene + 0.02, alpha=1,colour = "black") +
+      annotate("rect", xmin = 3, xmax = 3 + 0.01, ymin = label.df3$gene -0.08,
+                  ymax =label.df3$gene, alpha=1,colour = "black") +
+      annotate("rect", xmin = 4 - 0.01, xmax = 4, ymin = label.df3$gene - 0.08,
+                  ymax =label.df3$gene, alpha=1,colour = "black")
+  }
+  
+  jpeg(file =  paste0(output,"general_output/ssgsea_4group/specific/",gene,"_boxplot.jpeg"), wi = 7, 
+       he = 6, units = "in",res=480)
+  print(P)
+  dev.off()
+}
+
+```
+
+
+# 8. Type I interferon 
+
+## GO or KEGG
+```{r}
+type_I_interferon_mediated_signaling <-
+  get_genelist_pathway(name="type I interferon-mediated signaling pathway")
+type_II_interferon_mediated_signaling <-
+  get_genelist_pathway(name="type II interferon-mediated signaling pathway")
+
+interferon_mediated_signaling_pathway <-
+  get_genelist_pathway(name="interferon-mediated signaling pathway")
+
+Neutrophil_activation_in_immune <- 
+  unname(unlist(GOBP["Neutrophil_activation_in_immune"]))
+
+names(GOBP)
+unname(unlist(GOBP))
+```
+
+## Gs
+
+```{r}
+gs <- list("interferon_mediated_signaling_pathway"=interferon_mediated_signaling_pathway,
+           "type_I_interferon_mediated_signaling" = type_I_interferon_mediated_signaling,
+           "type_II_interferon_mediated_signaling" = type_II_interferon_mediated_signaling)
+```
+
+
+## SSGSEA
+
+```{r}
+GSVA_Expr <- t(as.matrix(datExpr))
+#GSVA_N <- t(gsva(count_N, modules, mx.diff=T,method="GSVA",kcdf = "Gaussian",abs.ranking=F)) 
+GSVA <- t(gsva(GSVA_Expr, gs,method="ssgsea",mx.diff=F,BPPARAM=MulticoreParam(24)))
+colnames(GSVA)
+## merge GSVA data with traidata
+df<- NULL
+if (all(rownames(GSVA) == rownames(traitData))) {
+  df <- cbind(traitData,GSVA)
+}
+dim(df)
+df %<>% subset(timepoint=="D0")
+
+```
+
+```{r}
+i=0
+#gene="type_I_interferon_mediated_signaling"
+for (gene in names(gs)) {
+  i = i + 1
+  print(paste0(i,". ",gene))
+  ## calculate wilcox 27TB
+  df_test <- df %>% dplyr::select(all_of(gene))
+  colnames(df_test)[1] <- "gene"
+  df_test1 <- df %>%
+    subset(Study=="27TB") %>%
+    dplyr::select(all_of(gene),status) %>%
+    mutate(status=factor(status))
+  colnames(df_test1)[1] <- "gene"
+  test <- df_test1 %>%
+    tbl_summary(by = status) %>%
+    add_p()
+  pval <- test$table_body$p.value
+  if(pval < 0.1){
+    sig1 = as.character(gtools::stars.pval(pval))
+    size_sig1 = 15
+  } else  {
+    sig1 <- ""
+    size_sig1 = 7}
+  df_test2 <- df %>%
+    subset(Study=="26TB") %>%
+    dplyr::select(all_of(gene),status) %>%
+    mutate(status=factor(status))
+  colnames(df_test2)[1] <- "gene"
+  test <- df_test2 %>%
+    tbl_summary(by = status) %>%
+    add_p()
+  pval <- test$table_body$p.value
+  if(pval < 0.1){
+    sig2 <- as.character(gtools::stars.pval(pval))
+    size_sig2 = 15
+  } else {
+    sig2 <- ""
+    size_sig2 = 7}
+  df_test3 <- df %>%
+    subset(Study %in% c("26TB","27TB")) %>%
+    dplyr::select(all_of(gene),Study) %>%
+    mutate(Study=factor(Study))
+  colnames(df_test3)[1] <- "gene"
+  test <- df_test3 %>%
+    tbl_summary(by = Study) %>%
+    add_p()
+  pval <- test$table_body$p.value
+  if(pval < 0.1){
+    sig3 <- as.character(gtools::stars.pval(pval))
+    size_sig3 = 15
+  } else {
+    sig3 <- ""
+    size_sig3 = 7}
+  
+  label.df1 <- data.frame(group_HIV = c("HIVneg-TBM"),
+                          gene = max(c(df_test1$gene,df_test2$gene))+ 0.01)
+  label.df2 <- data.frame(group_HIV = c("HIVpos-TBM"),
+                          gene = max(c(df_test1$gene,df_test2$gene))+ 0.01)
+  label.df3 <- data.frame(group_HIV = c("HIVpos-TBM"),
+                          gene = max(df_test$gene)+ 0.035)
+  
+  
+  # data to plot 
+  df_plot <- df %>%
+    dplyr::select(all_of(gene),group_HIV,Groups)
+  colnames(df_plot)[1] <- "gene"
+  P <- ggplot(df_plot, aes(x = group_HIV, y = gene)) +
+    geom_boxplot(size=1,position=position_dodge(1),width=0.7,
+                 fill="white",outlier.colour="red",
+                 outlier.shape=NA,outlier.size=3)+
+    geom_jitter(aes(color=Groups,fill=Groups),width=0.2,size=2,alpha = 0.5)+
+    scale_color_manual(values=c("#252525","#00441b","#3182bd","#de2d26"))+
+    theme_bw()+
+    labs(x="",y = "Enrichment score", title = gene)+#,subtitle = ""
+    theme(plot.title = element_text(size = 25),
+          legend.text = element_text(size = 20) ,
+          #legend.position="bottom",
+          legend.title = element_text(size = 20,color="black",face="bold"),
+          axis.text = element_text(size = 25),
+          axis.text.x=element_text(color="black",size=13,face="bold"),
+          axis.title.x = element_text(size = 20,color="black",face="bold"),
+          axis.text.y=element_text(color="black",size=20),
+          axis.title.y = element_text(size = 20,color="black",face="bold"),
+          axis.title= element_text(size = 40,color="black",face="bold"))+
+    scale_x_discrete("",labels = c("Healthy" = "Healthy \n Controls",
+                                   "PTB" = "PTB",
+                                   "HIVneg-TBM"="HIVneg\nTBM",
+                                   "HIVpos-TBM"="HIVpos\nTBM")) +
+    geom_text(data = label.df1, label = sig1, size=size_sig1) +
+    geom_text(data = label.df2, label = sig2, size=size_sig2)
+  if(sig3 != "") {
+    P <- P +  geom_text(data = label.df3, aes(x=3.5, y=gene), label = sig3, size=size_sig3) +
+      annotate("rect", xmin = 3, xmax = 4, ymin = label.df3$gene,
+                  ymax =label.df3$gene + 0.001, alpha=1,colour = "black") +
+      annotate("rect", xmin = 3, xmax = 3 + 0.01, ymin = label.df3$gene -0.002,
+                  ymax =label.df3$gene, alpha=1,colour = "black") +
+      annotate("rect", xmin = 4 - 0.01, xmax = 4, ymin = label.df3$gene - 0.002,
+                  ymax =label.df3$gene, alpha=1,colour = "black")
+  }
+  jpeg(file =  paste0(output,"general_output/ssgsea_4group/others/",gene,"_boxplot.jpeg"),
+       wi = 7, he = 6, units = "in",res=480)
+  print(P)
+  dev.off()
+}
+
+```
+
+
+## BOX plot 4 Group
+
+```{r}
+gene="TCEA3"
+i=0
+for (gene in c(names(gs),hub_genes)) {
+  i = i + 1
+  print(paste0(i,". ",gene))
+  ## calculate wilcox 27TB
+  df_test <- df %>% dplyr::select(all_of(gene))
+  colnames(df_test)[1] <- "gene"
+  df_test1 <- df %>%
+    subset(Study=="27TB") %>%
+    dplyr::select(all_of(gene),status) %>%
+    mutate(status=factor(status))
+  colnames(df_test1)[1] <- "gene"
+  test <- df_test1 %>%
+    tbl_summary(by = status) %>%
+    add_p()
+  pval <- test$table_body$p.value
+  if(pval < 0.1){
+    sig1 = as.character(gtools::stars.pval(pval))
+    size_sig1 = 15
+  } else  {
+    sig1 <- ""
+    size_sig1 = 7}
+  df_test2 <- df %>%
+    subset(Study=="26TB") %>%
+    dplyr::select(all_of(gene),status) %>%
+    mutate(status=factor(status))
+  colnames(df_test2)[1] <- "gene"
+  test <- df_test2 %>%
+    tbl_summary(by = status) %>%
+    add_p()
+  pval <- test$table_body$p.value
+  if(pval < 0.1){
+    sig2 <- as.character(gtools::stars.pval(pval))
+    size_sig2 = 15
+  } else {
+    sig2 <- ""
+    size_sig2 = 7}
+  df_test3 <- df %>%
+    subset(Study %in% c("26TB","27TB")) %>%
+    dplyr::select(all_of(gene),Study) %>%
+    mutate(Study=factor(Study))
+  colnames(df_test3)[1] <- "gene"
+  test <- df_test3 %>%
+    tbl_summary(by = Study) %>%
+    add_p()
+  pval <- test$table_body$p.value
+  if(pval < 0.1){
+    sig3 <- as.character(gtools::stars.pval(pval))
+    size_sig3 = 15
+  } else {
+    sig3 <- ""
+    size_sig3 = 7}
+  
+  label.df1 <- data.frame(group_HIV = c("HIVneg-TBM"),
+                          gene = max(c(df_test1$gene,df_test2$gene))+ 0.01)
+  label.df2 <- data.frame(group_HIV = c("HIVpos-TBM"),
+                          gene = max(c(df_test1$gene,df_test2$gene))+ 0.01)
+  label.df3 <- data.frame(group_HIV = c("HIVpos-TBM"),
+                          gene = max(df_test$gene)+ 0.035)
+  
+  if (gene %in% hub_genes) {
+    label.df1 <- data.frame(group_HIV = c("HIVneg-TBM"),
+                          gene = max(c(df_test1$gene,df_test2$gene))+ 0.5)
+    label.df2 <- data.frame(group_HIV = c("HIVpos-TBM"),
+                          gene = max(c(df_test1$gene,df_test2$gene))+ 00.5)
+    label.df3 <- data.frame(group_HIV = c("HIVpos-TBM"),
+                          gene = max(df_test$gene)+ 1)
+  }
+  
+  
+  # data to plot 
+  df_plot <- df %>%
+    dplyr::select(all_of(gene),group_HIV,Groups)
+  colnames(df_plot)[1] <- "gene"
+  table(is.na(df_plot$group_HIV))
+  P <- ggplot(df_plot, aes(x = group_HIV, y = gene)) +
+    geom_boxplot(size=1,position=position_dodge(1),width=0.7,
+                 fill="white",outlier.colour="red",
+                 outlier.shape=NA,outlier.size=3)+
+    geom_jitter(aes(color=Groups,fill=Groups),width=0.2,size=2,alpha = 0.5)+
+    scale_color_manual(values=c("#252525","#00441b","#3182bd","#de2d26"))+
+    theme_bw()+
+    labs(x="",y = "Enrichment score", title = gene)+#,subtitle = ""
+    theme(plot.title = element_text(size = 25),
+          legend.text = element_text(size = 20) ,
+          #legend.position="bottom",
+          legend.title = element_text(size = 20,color="black",face="bold"),
+          axis.text = element_text(size = 25),
+          axis.text.x=element_text(color="black",size=13,face="bold"),
+          axis.title.x = element_text(size = 20,color="black",face="bold"),
+          axis.text.y=element_text(color="black",size=20),
+          axis.title.y = element_text(size = 20,color="black",face="bold"),
+          axis.title= element_text(size = 40,color="black",face="bold"))+
+    scale_x_discrete("",labels = c("Healthy" = "Healthy \n Controls",
+                                   "PTB" = "PTB",
+                                   "HIVneg-TBM"="HIVneg\nTBM",
+                                   "HIVpos-TBM"="HIVpos\nTBM")) +
+    geom_text(data = label.df1, label = sig1, size=size_sig1) +
+    geom_text(data = label.df2, label = sig2, size=size_sig2)
+  if(sig3 != "" & gene %nin% hub_genes) {
+    P <- P +  geom_text(data = label.df3, aes(x=3.5, y=gene), label = sig3, size=size_sig3) +
+      annotate("rect", xmin = 3, xmax = 4, ymin = label.df3$gene,
+                  ymax =label.df3$gene + 0.001, alpha=1,colour = "black") +
+      annotate("rect", xmin = 3, xmax = 3 + 0.01, ymin = label.df3$gene -0.002,
+                  ymax =label.df3$gene, alpha=1,colour = "black") +
+      annotate("rect", xmin = 4 - 0.01, xmax = 4, ymin = label.df3$gene - 0.002,
+                  ymax =label.df3$gene, alpha=1,colour = "black")
+  }
+  
+  if(sig3 != "" & gene %in% hub_genes) {
+    P <- P +  geom_text(data = label.df3, aes(x=3.5, y=gene), label = sig3, size=size_sig3) +
+      annotate("rect", xmin = 3, xmax = 4, ymin = label.df3$gene,
+                  ymax =label.df3$gene + 0.02, alpha=1,colour = "black") +
+      annotate("rect", xmin = 3, xmax = 3 + 0.01, ymin = label.df3$gene -0.08,
+                  ymax =label.df3$gene, alpha=1,colour = "black") +
+      annotate("rect", xmin = 4 - 0.01, xmax = 4, ymin = label.df3$gene - 0.08,
+                  ymax =label.df3$gene, alpha=1,colour = "black")
+  }
+  
+  jpeg(file =  paste0(output,"general_output/ssgsea_4group/Others_Gene_Pathways/",gene,"_boxplot.jpeg"), wi = 7, 
+       he = 6, units = "in",res=480)
+  print(P)
+  dev.off()
+}
+
+```
+
+
+
+# 6.QUSAGE
+
+## GO
+
+
+```{r}
+Neutrophil_activation_in_immune <- unname(unlist(GOBP["neutrophil activation involved in immune response"]))
+Reg_of_inflammatory_response <- unname(unlist(GOBP["regulation of inflammatory response"]))
+#Response_to_bacterium <- unname(unlist(GOBP["response to bacterium"]))
+Response_to_bacterium <- get_genelist_pathway(name="response to bacterium")
+
+#Acute_inflammatory_response <- unname(unlist(GOBP["acute inflammatory response"]))
+Acute_inflammatory_response <- get_genelist_pathway(name="acute inflammatory response")
+
+#Pos_reg_of_response_to_external_stimulus  <- unname(unlist(GOBP["positive regulation of response to external stimulus"]))
+Pos_reg_of_response_to_external_stimulus <- get_genelist_pathway(name="positive regulation of response to external stimulus")
+
+#Pos_reg_of_cytokine_production <- unname(unlist(GOBP["positive regulation of cytokine production"]))
+Pos_reg_of_cytokine_production <- get_genelist_pathway(name="positive regulation of cytokine production")
+```
+
+
+
+```{r}
+## brown GO
+B_cell_activation <- get_genelist_pathway(name="B cell activation")
+B_cell_receptor_signaling_pathway <- get_genelist_pathway(name="B cell receptor signaling pathway")
+T_cell_activation <- get_genelist_pathway(name="T cell activation")
+Adaptive_immune_response <- get_genelist_pathway(name="adaptive immune response")
+Lymphocyte_proliferation  <- get_genelist_pathway(name="lymphocyte proliferation")
+Immune_response_activating_cell_surface_receptor_signaling_pathway <- get_genelist_pathway(name="immune response-activating cell surface receptor signaling pathway")
+Reg_of_B_cell_activation <- get_genelist_pathway(name="regulation of B cell activation")
+Leukocyte_cell_cell_adhesion <- get_genelist_pathway(name="leukocyte cell-cell adhesion")
+Reg_of_antigen_receptor_mediated_signaling_pathway <- get_genelist_pathway(name="regulation of antigen receptor-mediated signaling pathway")
+```
+
+
+
+## KEGG
+
+```{r}
+Hematopoietic_cell_lineage <- get_genelist_pathway_kegg(hsa_ID = "hsa04640")
+Cytokine_cytokine_receptor_interaction <- get_genelist_pathway_kegg(hsa_ID = "hsa04060")
+T_cell_receptor_signaling_pathway <- get_genelist_pathway_kegg(hsa_ID = "hsa04660")
+NF_kappa_B_signaling_pathway <- get_genelist_pathway_kegg(hsa_ID = "hsa04064")
+B_cell_receptor_signaling_pathway <- get_genelist_pathway_kegg(hsa_ID = "hsa04662")
+Cell_adhesion_molecules <- get_genelist_pathway_kegg(hsa_ID = "hsa04514")
+```
+
+
+```{r}
+gs <- list("Extracellular_matrix_organization"= Extracellular_matrix_organization,
+           "Blood_vessel_development" = Blood_vessel_development,
+           "Angiogenesis" = Angiogenesis,
+           "Neutrophil_activation_in_immune" = Neutrophil_activation_in_immune,
+           "Response_to_bacterium" = Response_to_bacterium,
+           "Acute_inflammatory_response" = Acute_inflammatory_response,
+           "Reg_of_inflammatory_response" =Reg_of_inflammatory_response,
+           "Pos_reg_of_cytokine_production" = Pos_reg_of_cytokine_production,
+           "B_cell_activation"=B_cell_activation,
+           "T_cell_activation" = T_cell_activation,
+           "Adaptive_immune_response"= Adaptive_immune_response,
+           "Lymphocyte_proliferation" = Lymphocyte_proliferation,
+           "Immune_response_activating_cell_surface_receptor_signaling" = Immune_response_activating_cell_surface_receptor_signaling_pathway,
+           "Reg_of_B_cell_activation" = Reg_of_B_cell_activation,
+           "Leukocyte_cell_cell_adhesion" = Leukocyte_cell_cell_adhesion,
+           "Reg_of_antigen_receptor_mediated_signaling" = Reg_of_antigen_receptor_mediated_signaling_pathway,
+           "Hematopoietic_cell_lineage" = Hematopoietic_cell_lineage,
+           "Cytokine_cytokine_receptor_interaction" = Cytokine_cytokine_receptor_interaction,
+           "T_cell_receptor_signaling_pathway" = T_cell_receptor_signaling_pathway,
+           "NF_kappa_B_signaling_pathway" = NF_kappa_B_signaling_pathway,
+           "B_cell_receptor_signaling_pathway" = B_cell_receptor_signaling_pathway,
+           "Cell_adhesion_molecules" = Cell_adhesion_molecules)
+```
+
+## qusage test
+
+```{r}
+dim(GSVA_Expr)
+names(traitData)
+table(traitData$status)
+
+design <- traitData$status
+contrast="Yes-No"
+qs.results = qusage(GSVA_Expr, design, contrast, gs)
+summary(qs.results)
+jpeg(file =  paste0(output,"general_output/qusage/","AllTBM_DeathvsSur.jpeg"), wi = 7,
+       he = 5, units = "in",res=480)
+plotCIs(qs.results,  cex.xaxis=0.5,ylab="log2 fold change of pathway activity")
+dev.off()
+
+
+
+design <- traitData$group_qusage
+contrast="HIVpos_D-HIVpos_S"
+qs.results1 = qusage(GSVA_Expr, design, contrast, gs)
+summary(qs.results1)
+plotCIs(qs.results1)
+
+contrast="HIVneg_D-HIVneg_S"
+qs.results2 = qusage(GSVA_Expr, design, contrast, gs)
+summary(qs.results2)
+plotCIs(qs.results2)
+
+
+jpeg(file =  paste0(output,"general_output/qusage/","TBMHIVposvsNeg_DeathvsSur.jpeg"), wi = 7,
+       he = 5, units = "in",res=480)
+plotCIs(qs.results1,cex.xaxis=1,ylab="log2 fold change of pathway activity", use.p.colors=FALSE,sort.by="none")
+plotCIs(qs.results2,cex.xaxis=1,ylab="log2 fold change of pathway activity", use.p.colors=FALSE,sort.by="none")
+
+
+plotCIs(qs.results2, add=T,shift = 0.4, use.p.colors=FALSE,sort.by=c("none"))
+dev.off()
+str(qs.results2)
+class(qs.results2)
+
+
+contrast="HIVpos_D-HIVneg_D"
+qs.results3 = qusage(GSVA_Expr, design, contrast, gs)
+summary(qs.results3)
+plotCIs(qs.results3)
+
+
+numPathways(qs.results)
+
+plotCIs(qs.results,addGrid=F)
+plotDensityCurves(qs.results,path.index=1,xlim=c(-0.2,0.9),
+                  col=3,main=pw)
+plotCIsGenes(qs.results,path.index=1)
+
+# names(traitData)
+# qs.result<-qgen(eset = GSVA_Expr,traitData,geneSets=target_GO,
+#                 fixed= ~status,contrast.factor=~status,contrast=contrast,
+#                 design.sampleid="LIMS_ID")
+# summary(qs.result)
+```
+
+
+
+
